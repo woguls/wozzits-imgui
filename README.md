@@ -1,8 +1,18 @@
 # wozzits-imgui
 
-Dear ImGui integration layer for Wozzits.
+`wozzits-imgui` provides the Dear ImGui integration layer for Wozzits development tools.
 
-This repo owns the Wozzits-facing ImGui adapter code. Dear ImGui itself is included as a git submodule under:
+It owns ImGui context setup, platform/backend integration, and frame rendering helpers.
+It does not own Wozzits-specific tools such as asset inspectors, scene graph panels,
+benchmark dashboards, or script bindings. Those belong in higher-level devtool modules.
 
-```text
-external/imgui
+Initial backend target:
+
+- Win32 platform backend
+- DirectX 12 renderer backend
+
+Future users:
+
+- `wozzits-devtools`
+- Wozzits debug applications
+- optional V8-driven tool panels

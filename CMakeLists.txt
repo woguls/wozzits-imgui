@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 project(wozzits_imgui LANGUAGES CXX)
 
 option(WOZZITS_IMGUI_BUILD_TESTS "Build wozzits-imgui tests" ON)
+option(WOZZITS_IMGUI_BUILD_EXAMPLES "Build wozzits-imgui examples" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -55,4 +56,8 @@ if(WOZZITS_IMGUI_BUILD_TESTS)
     )
 
     add_test(NAME imgui_context_smoke COMMAND imgui_context_smoke)
+endif()
+
+if(WOZZITS_IMGUI_BUILD_EXAMPLES)
+    add_subdirectory(examples/hello_imgui_win32_dx12)
 endif()
