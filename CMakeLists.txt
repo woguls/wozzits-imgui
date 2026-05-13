@@ -60,4 +60,5 @@ endif()
 
 if(WOZZITS_IMGUI_BUILD_EXAMPLES)
     add_subdirectory(examples/hello_imgui_win32_dx12)
+    add_subdirectory(examples/wozzits_toolhost_dx12)
 endif()
