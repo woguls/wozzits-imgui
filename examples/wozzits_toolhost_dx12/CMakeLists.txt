@@ -51,3 +51,10 @@ if(MSVC)
             NOMINMAX
         )
 endif()
+
+add_custom_command(TARGET wozzits_toolhost_dx12 POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_LIST_DIR}/../../../wozzits-window-engine/window_engine/resources"
+        "$<TARGET_FILE_DIR:wozzits_toolhost_dx12>/resources"
+    COMMENT "Copying Wozzits resources for wozzits_toolhost_dx12"
+)

@@ -1,8 +1,11 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#include <Windows.h>
+
+#include <engine/engine.h>
+#include <engine/game_app.h>
 
 #include <window/window2.h>
-#include <event/platform_event.h>
 
 #include <gpu/gpu.h>
 #include <gpu/dx12/dx12_internal.h>
@@ -12,6 +15,12 @@
 #include <imgui.h>
 #include <backends/imgui_impl_win32.h>
 #include <backends/imgui_impl_dx12.h>
+
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
+    HWND hWnd,
+    UINT msg,
+    WPARAM wParam,
+    LPARAM lParam);
 
 #include <d3d12.h>
 
@@ -24,29 +33,42 @@ namespace
     struct ImGuiDx12SrvAllocator
     {
         ID3D12DescriptorHeap* heap = nullptr;
-        D3D12_DESCRIPTOR_HEAP_TYPE heap_type = D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES;
+        D3D12_DESCRIPTOR_HEAP_TYPE heap_type =
+            D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES;
+
         D3D12_CPU_DESCRIPTOR_HANDLE heap_start_cpu{};
         D3D12_GPU_DESCRIPTOR_HANDLE heap_start_gpu{};
+
         UINT heap_handle_increment = 0;
         ImVector<int> free_indices;
 
-        void create(ID3D12Device* device, ID3D12DescriptorHeap* descriptor_heap)
+        void create(
+            ID3D12Device* device,
+            ID3D12DescriptorHeap* descriptor_heap)
         {
+            assert(device != nullptr);
+            assert(descriptor_heap != nullptr);
             assert(heap == nullptr);
             assert(free_indices.empty());
 
             heap = descriptor_heap;
 
-            D3D12_DESCRIPTOR_HEAP_DESC desc = heap->GetDesc();
+            const D3D12_DESCRIPTOR_HEAP_DESC desc =
+                heap->GetDesc();
+
             heap_type = desc.Type;
 
-            heap_start_cpu = heap->GetCPUDescriptorHandleForHeapStart();
-            heap_start_gpu = heap->GetGPUDescriptorHandleForHeapStart();
+            heap_start_cpu =
+                heap->GetCPUDescriptorHandleForHeapStart();
+
+            heap_start_gpu =
+                heap->GetGPUDescriptorHandleForHeapStart();
 
             heap_handle_increment =
                 device->GetDescriptorHandleIncrementSize(heap_type);
 
-            free_indices.reserve(static_cast<int>(desc.NumDescriptors));
+            free_indices.reserve(
+                static_cast<int>(desc.NumDescriptors));
 
             for (int i = static_cast<int>(desc.NumDescriptors); i > 0; --i)
                 free_indices.push_back(i - 1);
@@ -62,6 +84,8 @@ namespace
             D3D12_CPU_DESCRIPTOR_HANDLE* out_cpu,
             D3D12_GPU_DESCRIPTOR_HANDLE* out_gpu)
         {
+            assert(out_cpu != nullptr);
+            assert(out_gpu != nullptr);
             assert(free_indices.Size > 0);
 
             const int index = free_indices.back();
@@ -81,10 +105,14 @@ namespace
             D3D12_GPU_DESCRIPTOR_HANDLE gpu)
         {
             const int cpu_index =
-                static_cast<int>((cpu.ptr - heap_start_cpu.ptr) / heap_handle_increment);
+                static_cast<int>(
+                    (cpu.ptr - heap_start_cpu.ptr) /
+                    heap_handle_increment);
 
             const int gpu_index =
-                static_cast<int>((gpu.ptr - heap_start_gpu.ptr) / heap_handle_increment);
+                static_cast<int>(
+                    (gpu.ptr - heap_start_gpu.ptr) /
+                    heap_handle_increment);
 
             assert(cpu_index == gpu_index);
 
@@ -92,11 +120,16 @@ namespace
         }
     };
 
-    static ImGuiDx12SrvAllocator g_imgui_srv_allocator{};
-}
+    struct ToolhostState
+    {
+        wz::app::GameApp app{};
 
-namespace
-{
+        ID3D12DescriptorHeap* imgui_srv_heap = nullptr;
+        ImGuiDx12SrvAllocator imgui_srv_allocator{};
+
+        bool imgui_ready = false;
+    };
+
     ID3D12DescriptorHeap* create_imgui_srv_heap(ID3D12Device* device)
     {
         assert(device != nullptr);
@@ -107,8 +140,11 @@ namespace
         desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 
         ID3D12DescriptorHeap* heap = nullptr;
+
         const HRESULT hr =
-            device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&heap));
+            device->CreateDescriptorHeap(
+                &desc,
+                IID_PPV_ARGS(&heap));
 
         assert(SUCCEEDED(hr));
         assert(heap != nullptr);
@@ -116,211 +152,228 @@ namespace
         return heap;
     }
 
-    void poll_window_events(
-        const wz::window::WindowHandle& window,
-        bool& running,
-        wz::gpu::Device& device)
+    static ToolhostState* g_toolhost_state = nullptr;
+
+    bool init_imgui_for_app(ToolhostState& state)
     {
-        wz::window::pump_messages();
+        wz::gpu::Device& device =
+            state.app.ctx.device;
 
-        PlatformEvent event{};
+        void* hwnd =
+            wz::window::get_native_handle(state.app.ctx.window);
 
-        while (wz::window::poll_event(window, event))
-        {
-            switch (event.type)
+        if (hwnd == nullptr)
+            return false;
+
+        ID3D12Device* dx_device =
+            wz::gpu::dx12::internal::get_device(device);
+
+        if (dx_device == nullptr)
+            return false;
+
+        state.imgui_srv_heap =
+            create_imgui_srv_heap(dx_device);
+
+        state.imgui_srv_allocator.create(
+            dx_device,
+            state.imgui_srv_heap);
+
+        IMGUI_CHECKVERSION();
+
+        if (!wz::imgui::create_context())
+            return false;
+
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+        ImGui::StyleColorsDark();
+
+        if (!ImGui_ImplWin32_Init(hwnd))
+            return false;
+
+        wz::window::set_native_message_hook(
+            state.app.ctx.window,
+            [](void* hwnd,
+                unsigned int msg,
+                uintptr_t wparam,
+                intptr_t lparam,
+                void*) -> bool
             {
-            case PlatformEvent::Type::Close:
-                running = false;
-                break;
+                return ImGui_ImplWin32_WndProcHandler(
+                    static_cast<HWND>(hwnd),
+                    static_cast<UINT>(msg),
+                    static_cast<WPARAM>(wparam),
+                    static_cast<LPARAM>(lparam)) != 0;
+            },
+            nullptr);
+        ImGui_ImplDX12_InitInfo init_info{};
+        init_info.Device = dx_device;
+        init_info.CommandQueue =
+            wz::gpu::dx12::internal::get_command_queue(device);
 
-            case PlatformEvent::Type::Resize:
-                if (event.resize.width > 0 && event.resize.height > 0)
-                {
-                    wz::gpu::resize(
-                        device,
-                        event.resize.width,
-                        event.resize.height);
-                }
-                break;
+        init_info.NumFramesInFlight =
+            static_cast<int>(
+                wz::gpu::dx12::internal::get_backbuffer_count());
 
-            default:
-                break;
-            }
+        init_info.RTVFormat =
+            wz::gpu::dx12::internal::get_backbuffer_format();
+
+        init_info.DSVFormat = DXGI_FORMAT_UNKNOWN;
+        init_info.SrvDescriptorHeap = state.imgui_srv_heap;
+
+        init_info.SrvDescriptorAllocFn =
+            [](ImGui_ImplDX12_InitInfo*,
+                D3D12_CPU_DESCRIPTOR_HANDLE* out_cpu,
+                D3D12_GPU_DESCRIPTOR_HANDLE* out_gpu)
+            {
+                assert(g_toolhost_state != nullptr);
+                g_toolhost_state->imgui_srv_allocator.alloc(
+                    out_cpu,
+                    out_gpu);
+            };
+
+        init_info.SrvDescriptorFreeFn =
+            [](ImGui_ImplDX12_InitInfo*,
+                D3D12_CPU_DESCRIPTOR_HANDLE cpu,
+                D3D12_GPU_DESCRIPTOR_HANDLE gpu)
+            {
+                assert(g_toolhost_state != nullptr);
+                g_toolhost_state->imgui_srv_allocator.free(
+                    cpu,
+                    gpu);
+            };
+
+        if (!ImGui_ImplDX12_Init(&init_info))
+            return false;
+
+        state.imgui_ready = true;
+        return true;
+    }
+
+    void shutdown_imgui(ToolhostState& state)
+    {
+        if (state.imgui_ready)
+        {
+            ImGui_ImplDX12_Shutdown();
+            wz::window::set_native_message_hook(
+                state.app.ctx.window,
+                nullptr,
+                nullptr);
+
+            ImGui_ImplWin32_Shutdown();
+            state.imgui_ready = false;
         }
 
-        if (wz::window::window_should_close(window))
-            running = false;
+        if (wz::imgui::has_context())
+            wz::imgui::destroy_context();
+
+        state.imgui_srv_allocator.destroy();
+
+        if (state.imgui_srv_heap != nullptr)
+        {
+            state.imgui_srv_heap->Release();
+            state.imgui_srv_heap = nullptr;
+        }
     }
-}
 
-int main()
-{
-    wz::window::WindowDesc desc{};
-    desc.title = "Wozzits ImGui Toolhost";
-    desc.width = 1280;
-    desc.height = 720;
-
-    wz::window::WindowHandle window =
-        wz::window::create_window(desc);
-
-    void* hwnd =
-        wz::window::get_native_handle(window);
-
-    assert(hwnd != nullptr);
-
-    wz::gpu::Device device =
-        wz::gpu::create_device(window);
-
-    assert(device.valid());
-
-    ID3D12Device* dx_device =
-        wz::gpu::dx12::internal::get_device(device);
-
-    ID3D12GraphicsCommandList* cmd =
-        wz::gpu::dx12::internal::get_command_list(device);
-
-    ID3D12CommandQueue* queue =
-        wz::gpu::dx12::internal::get_command_queue(device);
-
-    assert(dx_device != nullptr);
-    assert(cmd != nullptr);
-    assert(queue != nullptr);
-
-
-    ID3D12DescriptorHeap* imgui_srv_heap =
-        create_imgui_srv_heap(dx_device);
-
-    g_imgui_srv_allocator.create(dx_device, imgui_srv_heap);
-
-
-
-    IMGUI_CHECKVERSION();
-
-    const bool imgui_context_created =
-        wz::imgui::create_context();
-
-    assert(imgui_context_created);
-
-    ImGuiIO& io = ImGui::GetIO();
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    // Keep docking/viewports off for now.
-
-    assert(imgui_context_created);
-    assert(wz::imgui::has_context());
-
-    ImGui::StyleColorsDark();
-
-    const bool win32_ok =
-        ImGui_ImplWin32_Init(hwnd);
-
-    assert(win32_ok);
-
-    ImGui_ImplDX12_InitInfo init_info{};
-    init_info.Device = dx_device;
-    init_info.CommandQueue =
-        wz::gpu::dx12::internal::get_command_queue(device);
-    init_info.NumFramesInFlight =
-        static_cast<int>(wz::gpu::dx12::internal::get_backbuffer_count());
-    init_info.RTVFormat =
-        wz::gpu::dx12::internal::get_backbuffer_format();
-    init_info.DSVFormat = DXGI_FORMAT_UNKNOWN;
-
-    init_info.SrvDescriptorHeap = imgui_srv_heap;
-
-    init_info.SrvDescriptorAllocFn =
-        [](ImGui_ImplDX12_InitInfo*,
-            D3D12_CPU_DESCRIPTOR_HANDLE* out_cpu,
-            D3D12_GPU_DESCRIPTOR_HANDLE* out_gpu)
-        {
-            g_imgui_srv_allocator.alloc(out_cpu, out_gpu);
-        };
-
-    init_info.SrvDescriptorFreeFn =
-        [](ImGui_ImplDX12_InitInfo*,
-            D3D12_CPU_DESCRIPTOR_HANDLE cpu,
-            D3D12_GPU_DESCRIPTOR_HANDLE gpu)
-        {
-            g_imgui_srv_allocator.free(cpu, gpu);
-        };
-
-    const bool dx12_ok =
-        ImGui_ImplDX12_Init(&init_info);
-
-    assert(dx12_ok);
-
-    std::cout << "Wozzits ImGui toolhost running\n";
-
-    bool running = true;
-    std::uint64_t frame_index = 0;
-
-    while (running)
+    void begin_imgui_frame(
+        ToolhostState& state,
+        const wz::engine::FrameContext& fctx)
     {
-        poll_window_events(window, running, device);
-
-        if (!running)
-            break;
-
-        wz::gpu::begin_frame(device);
-        wz::gpu::clear(device, 0.0f, 0.15f, 0.35f, 1.0f);
+        wz::gpu::Device& device =
+            state.app.ctx.device;
 
         ImGui_ImplDX12_NewFrame();
         ImGui_ImplWin32_NewFrame();
-        ImGuiIO& _io = ImGui::GetIO();
-        _io.DisplaySize = ImVec2(
-            static_cast<float>(wz::gpu::dx12::internal::get_width(device)),
-            static_cast<float>(wz::gpu::dx12::internal::get_height(device)));
-
-        _io.DeltaTime = 1.0f / 60.0f;
-
-        ImGui::NewFrame();
-        ImGui::GetBackgroundDrawList()->AddRectFilled(
-            ImVec2(40.0f, 40.0f),
-            ImVec2(300.0f, 160.0f),
-            IM_COL32(255, 0, 0, 255));
-
-        ImGui::SetNextWindowPos(ImVec2(40.0f, 40.0f), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(420.0f, 180.0f), ImGuiCond_Always);
-        ImGui::Begin(
-            "Wozzits Toolhost",
-            nullptr,
-            ImGuiWindowFlags_NoCollapse |
-            ImGuiWindowFlags_NoSavedSettings);
-
-        ImGui::Text("Hello from Wozzits ImGui");
-        ImGui::Text(
-            "Frame: %llu",
-            static_cast<unsigned long long>(frame_index));
-        ImGui::Button("Visible button");
-        ImGui::Text("This executable lives above window-engine.");
-
-
-        ImGui::End();
-
-        ImGui::Render();
-
-        ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
 
         ImGuiIO& io = ImGui::GetIO();
 
-        ImDrawData* draw_data = ImGui::GetDrawData();
+        const UINT width =
+            wz::gpu::dx12::internal::get_width(device);
+
+        const UINT height =
+            wz::gpu::dx12::internal::get_height(device);
+
+        io.DisplaySize = ImVec2(
+            static_cast<float>(width),
+            static_cast<float>(height));
+
+        const double dt =
+            fctx.frame.delta_seconds();
+
+        io.DeltaTime =
+            dt > 0.0 ? static_cast<float>(dt) : (1.0f / 60.0f);
+
+        ImGui::NewFrame();
+    }
+
+    void draw_toolhost_panel(
+        const ToolhostState& state,
+        const wz::engine::FrameContext& fctx)
+    {
+        const wz::app::GameApp& app = state.app;
+
+        ImGui::SetNextWindowPos(
+            ImVec2(24.0f, 24.0f),
+            ImGuiCond_Once);
+
+        ImGui::SetNextWindowSize(
+            ImVec2(420.0f, 220.0f),
+            ImGuiCond_Once);
+
+        ImGui::Begin("Wozzits Toolhost");
+
+        ImGui::Text("Running GameApp with ImGui overlay");
+        ImGui::Separator();
+
+        ImGui::Text(
+            "Frame: %llu",
+            static_cast<unsigned long long>(fctx.frame.index));
+
+        ImGui::Text(
+            "Camera: x=%.3f y=%.3f",
+            app.camera.x,
+            app.camera.y);
+
+        ImGui::Text(
+            "Debug objects ready: %s",
+            app.debug_object.ready ? "yes" : "no");
+
+        ImGui::Text(
+            "Compiled scene valid: %s",
+            app.debug_object.compiled_scene_valid ? "yes" : "no");
+
+        ImGui::End();
+    }
+
+    void render_imgui(
+        ToolhostState& state,
+        const wz::engine::FrameContext& fctx)
+    {
+        wz::gpu::Device& device =
+            state.app.ctx.device;
+
+        begin_imgui_frame(state, fctx);
+
+        draw_toolhost_panel(state, fctx);
+
+        ImGui::Render();
+
+        ImDrawData* draw_data =
+            ImGui::GetDrawData();
 
         if (draw_data->Textures != nullptr)
         {
             for (ImTextureData* tex : *draw_data->Textures)
             {
                 if (tex->Status != ImTextureStatus_OK)
-                {
                     ImGui_ImplDX12_UpdateTexture(tex);
-                }
             }
         }
 
-        ID3D12DescriptorHeap* heaps[] =
-        {
-            imgui_srv_heap
-        };
+        ID3D12GraphicsCommandList* cmd =
+            wz::gpu::dx12::internal::get_command_list(device);
 
-        cmd = wz::gpu::dx12::internal::get_command_list(device);
         assert(cmd != nullptr);
 
         D3D12_CPU_DESCRIPTOR_HANDLE rtv =
@@ -332,31 +385,85 @@ int main()
             FALSE,
             nullptr);
 
+        ID3D12DescriptorHeap* heaps[] =
+        {
+            state.imgui_srv_heap
+        };
+
         cmd->SetDescriptorHeaps(1, heaps);
 
         ImGui_ImplDX12_RenderDrawData(
             draw_data,
             cmd);
-
-        wz::gpu::end_frame(device);
-        wz::gpu::present(device);
-
-        ++frame_index;
     }
 
-    ImGui_ImplDX12_Shutdown();
-    ImGui_ImplWin32_Shutdown();
-
-    wz::imgui::destroy_context();
-
-    if (imgui_srv_heap)
+    void toolhost_update(
+        wz::engine::Context& ctx,
+        wz::engine::FrameContext& fctx,
+        void* user_data)
     {
-        imgui_srv_heap->Release();
-        imgui_srv_heap = nullptr;
+        auto* state =
+            static_cast<ToolhostState*>(user_data);
+
+        assert(state != nullptr);
+
+        wz::app::update(
+            ctx,
+            fctx,
+            state->app);
+
+        if (!ctx.running)
+            return;
+
+        wz::gpu::begin_frame(state->app.ctx.device);
+        wz::gpu::clear(
+            state->app.ctx.device,
+            0.0f,
+            0.15f,
+            0.35f,
+            1.0f);
+
+        wz::app::render_contents(
+            state->app,
+            fctx);
+
+        render_imgui(
+            *state,
+            fctx);
+
+        wz::gpu::end_frame(state->app.ctx.device);
+        wz::gpu::present(state->app.ctx.device);
+    }
+}
+
+int main()
+{
+    ToolhostState state{};
+    g_toolhost_state = &state;
+
+    if (!wz::app::init(state.app))
+    {
+        g_toolhost_state = nullptr;
+        return 1;
     }
 
-    wz::gpu::destroy_device(device);
-    wz::window::destroy_window(window);
+    if (!init_imgui_for_app(state))
+    {
+        shutdown_imgui(state);
+        wz::app::shutdown(state.app);
+        g_toolhost_state = nullptr;
+        return 1;
+    }
+
+    wz::engine::run(
+        toolhost_update,
+        &state);
+
+    shutdown_imgui(state);
+
+    wz::app::shutdown(state.app);
+
+    g_toolhost_state = nullptr;
 
     return 0;
 }
