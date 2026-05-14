@@ -4,6 +4,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <cmath>
 
 #include <math/mat4.h>
 #include <math/math_types.h>
@@ -234,6 +235,94 @@ namespace
         return wz::math::mat4_identity();
     }
 
+    wz::math::Vec3 subtract(
+        const wz::math::Vec3& a,
+        const wz::math::Vec3& b)
+    {
+        return wz::math::Vec3{
+            a.x - b.x,
+            a.y - b.y,
+            a.z - b.z,
+        };
+    }
+
+    float dot(
+        const wz::math::Vec3& a,
+        const wz::math::Vec3& b)
+    {
+        return a.x * b.x + a.y * b.y + a.z * b.z;
+    }
+
+    wz::math::Vec3 cross(
+        const wz::math::Vec3& a,
+        const wz::math::Vec3& b)
+    {
+        return wz::math::Vec3{
+            a.y * b.z - a.z * b.y,
+            a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x,
+        };
+    }
+
+    wz::math::Vec3 normalize(
+        const wz::math::Vec3& v)
+    {
+        const float len =
+            std::sqrt(dot(v, v));
+
+        if (len <= 0.000001f)
+        {
+            return wz::math::Vec3{ 0.0f, 0.0f, 1.0f };
+        }
+
+        const float inv = 1.0f / len;
+
+        return wz::math::Vec3{
+            v.x * inv,
+            v.y * inv,
+            v.z * inv,
+        };
+    }
+
+    wz::math::Mat4 make_look_at_dx(
+        const wz::math::Vec3& eye,
+        const wz::math::Vec3& target,
+        const wz::math::Vec3& up)
+    {
+        const wz::math::Vec3 zaxis =
+            normalize(subtract(target, eye));
+
+        const wz::math::Vec3 xaxis =
+            normalize(cross(up, zaxis));
+
+        const wz::math::Vec3 yaxis =
+            cross(zaxis, xaxis);
+
+        wz::math::Mat4 view = wz::math::mat4_identity();
+
+        view.m[0] = xaxis.x;
+        view.m[1] = yaxis.x;
+        view.m[2] = zaxis.x;
+        view.m[3] = 0.0f;
+
+        view.m[4] = xaxis.y;
+        view.m[5] = yaxis.y;
+        view.m[6] = zaxis.y;
+        view.m[7] = 0.0f;
+
+        view.m[8] = xaxis.z;
+        view.m[9] = yaxis.z;
+        view.m[10] = zaxis.z;
+        view.m[11] = 0.0f;
+
+        view.m[12] = -dot(xaxis, eye);
+        view.m[13] = -dot(yaxis, eye);
+        view.m[14] = -dot(zaxis, eye);
+        view.m[15] = 1.0f;
+
+        return view;
+    }
+
     wz::math::Mat4 make_mesh_tool_view_proj(
         const MeshAssetToolCamera& camera,
         int width,
@@ -248,12 +337,34 @@ namespace
             ? static_cast<float>(width) / static_cast<float>(height)
             : 1280.0f / 720.0f;
 
-        wz::math::Mat4 view = wz::math::mat4_identity();
+        const wz::math::Vec3 target{
+            camera.target_x,
+            camera.target_y,
+            camera.target_z,
+        };
 
-        // First version: simple dolly camera using existing convention.
-        view.m[12] = -camera.target_x;
-        view.m[13] = -camera.target_y;
-        view.m[14] = camera.distance;
+        const float cp = std::cos(camera.pitch);
+        const float sp = std::sin(camera.pitch);
+        const float cy = std::cos(camera.yaw);
+        const float sy = std::sin(camera.yaw);
+
+        const wz::math::Vec3 eye{
+            target.x + camera.distance * cp * sy,
+            target.y + camera.distance * sp,
+            target.z - camera.distance * cp * cy,
+        };
+
+        const wz::math::Vec3 up{
+            0.0f,
+            1.0f,
+            0.0f,
+        };
+
+        const wz::math::Mat4 view =
+            make_look_at_dx(
+                eye,
+                target,
+                up);
 
         const wz::math::Mat4 projection =
             wz::math::projection_perspective_dx(
@@ -611,8 +722,8 @@ namespace
         ImGui::SliderFloat(
             "Pitch",
             &state.camera.pitch,
-            -1.45f,
-            1.45f);
+            -2.90f,
+            2.90f);
 
         ImGui::SliderFloat(
             "Distance",
@@ -627,7 +738,14 @@ namespace
 
         if (ImGui::Button("Reset Camera"))
         {
-            state.camera = MeshAssetToolCamera{};
+            state.camera = MeshAssetToolCamera{
+                .yaw = 0.0f,
+                .pitch = 0.25f,
+                .distance = 6.0f,
+                .target_x = 0.0f,
+                .target_y = 0.0f,
+                .target_z = 0.0f,
+            };
         }
 
         ImGui::End();
