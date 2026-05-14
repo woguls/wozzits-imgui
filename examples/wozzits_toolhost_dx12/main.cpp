@@ -332,6 +332,39 @@ namespace
         }
     }
 
+    static constexpr const char* k_startup_script =
+        "wz.log('wozzits toolhost script host online');"
+        "wz.tool.textPanel('Script Console', 'V8 scripting host is running.');"
+        "wz.tool.statsPanel('Script Info', ["
+        "  ['status', 'running'],"
+        "  ['host',   'wozzits-toolhost']"
+        "]);"
+        "wz.tool.buttonPanel('Script Tools', ["
+        "  ['Reload scripts',  'scripts.reload'],"
+        "  ['Clear logs',      'scripts.clear_logs']"
+        "]);"
+        "'startup ok';";
+
+    void dispatch_script_action(ToolhostState& state, const std::string& action)
+    {
+        if (action == "scripts.reload")
+        {
+            wz::script::clear_logs(state.scripts);
+            state.console.push_string("[script] reloading scripts");
+            wz::script::run_source(state.scripts, "startup.js", k_startup_script);
+            drain_script_panels(state);
+        }
+        else if (action == "scripts.clear_logs")
+        {
+            wz::script::clear_logs(state.scripts);
+            state.console.push_string("[script] logs cleared");
+        }
+        else
+        {
+            state.console.push_string("[script] unknown action: " + action);
+        }
+    }
+
     void draw_script_panels(ToolhostState& state)
     {
         float script_panel_x = 560.0f;
@@ -375,19 +408,25 @@ namespace
             ImGui::End();
         }
 
-        for (auto& panel : state.script_button_panels)
+        std::string pending_action;
+        for (const auto& panel : state.script_button_panels)
         {
             ImGui::SetNextWindowPos(ImVec2(script_panel_x, script_panel_y), ImGuiCond_FirstUseEver);
             ImGui::SetNextWindowSize(ImVec2(240.0f, 160.0f), ImGuiCond_FirstUseEver);
-            ImGui::Begin(panel.title.c_str());
             script_panel_y += 180.0f;
-            for (const auto& [label, action] : panel.buttons)
+            if (ImGui::Begin(panel.title.c_str()))
             {
-                if (ImGui::Button(label.c_str()))
-                    state.console.push_string("[script action] " + action);
+                for (const auto& [label, action] : panel.buttons)
+                {
+                    if (label.empty()) continue;
+                    if (ImGui::Button(label.c_str()))
+                        pending_action = action;
+                }
             }
             ImGui::End();
         }
+        if (!pending_action.empty())
+            dispatch_script_action(state, pending_action);
     }
 
 #endif // WOZZITS_ENABLE_V8_SCRIPTING
@@ -1005,19 +1044,6 @@ int main()
     }
 
     {
-        static constexpr const char* k_startup_script =
-            "wz.log('wozzits toolhost script host online');"
-            "wz.tool.textPanel('Script Console', 'V8 scripting host is running.');"
-            "wz.tool.statsPanel('Script Info', ["
-            "  ['status', 'running'],"
-            "  ['host',   'wozzits-toolhost']"
-            "]);"
-            "wz.tool.buttonPanel('Script Tools', ["
-            "  ['Reload scripts',  'scripts.reload'],"
-            "  ['Clear logs',      'scripts.clear_logs']"
-            "]);"
-            "'startup ok';";
-
         wz::script::run_source(state.scripts, "startup.js", k_startup_script);
         drain_script_panels(state);
     }
