@@ -4,12 +4,25 @@ project(wozzits_imgui LANGUAGES CXX)
 
 option(WOZZITS_IMGUI_BUILD_TESTS "Build wozzits-imgui tests" ON)
 option(WOZZITS_IMGUI_BUILD_EXAMPLES "Build wozzits-imgui examples" ON)
+option(WOZZITS_ENABLE_V8_SCRIPTING "Build with V8 scripting support" ON)
+
+if(WOZZITS_ENABLE_V8_SCRIPTING)
+    # V8 is built in Release mode; its objects embed _ITERATOR_DEBUG_LEVEL=0.
+    # Force the same value project-wide so lld-link sees no mismatch.
+    add_compile_definitions(_ITERATOR_DEBUG_LEVEL=0)
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(MSVC)
-    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+    if(WOZZITS_ENABLE_V8_SCRIPTING)
+        # V8 uses static CRT (/MT) — its allocator shim requires it.  Force /MT
+        # for all configs so every object in the link agrees.
+        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+    else()
+        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+    endif()
 endif()
 
 set(WOZZITS_IMGUI_EXTERNAL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/imgui")

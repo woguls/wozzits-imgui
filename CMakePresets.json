@@ -13,7 +13,8 @@
       "binaryDir": "${sourceDir}/build/ninja-debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "WOZZITS_IMGUI_BUILD_TESTS": "ON"
+        "WOZZITS_IMGUI_BUILD_TESTS": "ON",
+        "WOZZITS_ENABLE_V8_SCRIPTING": "ON"
       }
     },
     {
@@ -23,7 +24,8 @@
       "binaryDir": "${sourceDir}/build/ninja-release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "WOZZITS_IMGUI_BUILD_TESTS": "ON"
+        "WOZZITS_IMGUI_BUILD_TESTS": "ON",
+        "WOZZITS_ENABLE_V8_SCRIPTING": "ON"
       }
     }
   ],

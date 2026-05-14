@@ -1,3 +1,6 @@
+message(STATUS "The value of WOZZITS_ENABLE_V8_SCRIPTING is: ${WOZZITS_ENABLE_V8_SCRIPTING}")
+
+
 # ----------------------
 # dependency: window_engine
 # ----------------------
@@ -50,6 +53,18 @@ if(MSVC)
             WIN32_LEAN_AND_MEAN
             NOMINMAX
         )
+endif()
+
+if(WOZZITS_ENABLE_V8_SCRIPTING)
+    target_link_libraries(wozzits_toolhost_dx12
+        PRIVATE
+            wozzits_v8::wozzits_v8
+    )
+
+    target_compile_definitions(wozzits_toolhost_dx12
+        PRIVATE
+            WOZZITS_ENABLE_V8_SCRIPTING
+    )
 endif()
 
 add_custom_command(TARGET wozzits_toolhost_dx12 POST_BUILD

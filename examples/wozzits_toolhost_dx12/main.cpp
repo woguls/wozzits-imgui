@@ -19,6 +19,10 @@
 
 #include <wozzits/imgui/imgui_context.h>
 
+#ifdef WOZZITS_ENABLE_V8_SCRIPTING
+#include <wozzits/script/script_host.h>
+#endif
+
 #include <imgui.h>
 #include <backends/imgui_impl_win32.h>
 #include <backends/imgui_impl_dx12.h>
@@ -144,6 +148,16 @@ namespace
         bool auto_scroll = true;
         bool scroll_to_bottom = false;
 
+        void push_string(std::string text, wz::LogLevel level = wz::LogLevel::Info)
+        {
+            std::lock_guard lock(mutex);
+            lines.push_back(ConsoleLine{
+                .level = level,
+                .text  = std::move(text),
+            });
+            scroll_to_bottom = true;
+        }
+
         void push(const wz::logging::LogRecordView& record)
         {
             if (record.text == nullptr)
@@ -185,7 +199,198 @@ namespace
         ToolConsole console{};
 
         bool imgui_ready = false;
+
+#ifdef WOZZITS_ENABLE_V8_SCRIPTING
+        wz::script::ScriptHost* scripts = nullptr;
+
+        struct ScriptTextPanel
+        {
+            std::string title;
+            std::string text;
+        };
+
+        struct ScriptStatsPanel
+        {
+            std::string title;
+            std::vector<std::pair<std::string, std::string>> rows;
+        };
+
+        struct ScriptButtonPanel
+        {
+            std::string title;
+            std::vector<std::pair<std::string, std::string>> buttons;
+        };
+
+        std::vector<ScriptTextPanel>   script_text_panels;
+        std::vector<ScriptStatsPanel>  script_stats_panels;
+        std::vector<ScriptButtonPanel> script_button_panels;
+#endif
     };
+
+#ifdef WOZZITS_ENABLE_V8_SCRIPTING
+
+    template<typename T>
+    void upsert_script_panel(std::vector<T>& panels, T panel)
+    {
+        for (T& p : panels)
+        {
+            if (p.title == panel.title)
+            {
+                p = std::move(panel);
+                return;
+            }
+        }
+        panels.push_back(std::move(panel));
+    }
+
+    std::string copy_panel_str(const char* text)
+    {
+        return text ? std::string(text) : std::string{};
+    }
+
+    void drain_script_panels(ToolhostState& state)
+    {
+        {
+            const std::size_t count =
+                wz::script::pending_text_panel_count(state.scripts);
+
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                const char* t = wz::script::pending_text_panel_title(state.scripts, i, nullptr);
+                if (t == nullptr || t[0] == '\0') continue;
+                const char* x = wz::script::pending_text_panel_text(state.scripts, i, nullptr);
+
+                ToolhostState::ScriptTextPanel panel;
+                panel.title = copy_panel_str(t);
+                panel.text  = copy_panel_str(x);
+                upsert_script_panel(state.script_text_panels, std::move(panel));
+            }
+            wz::script::clear_pending_text_panels(state.scripts);
+        }
+
+        {
+            const std::size_t count =
+                wz::script::pending_stats_panel_count(state.scripts);
+
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                const char* t = wz::script::pending_stats_panel_title(state.scripts, i, nullptr);
+                if (t == nullptr || t[0] == '\0') continue;
+
+                ToolhostState::ScriptStatsPanel panel;
+                panel.title = copy_panel_str(t);
+
+                const std::size_t row_count =
+                    wz::script::pending_stats_panel_row_count(state.scripts, i);
+
+                for (std::size_t r = 0; r < row_count; ++r)
+                {
+                    const char* l = wz::script::pending_stats_panel_row_label(state.scripts, i, r, nullptr);
+                    const char* v = wz::script::pending_stats_panel_row_value(state.scripts, i, r, nullptr);
+                    panel.rows.emplace_back(copy_panel_str(l), copy_panel_str(v));
+                }
+                upsert_script_panel(state.script_stats_panels, std::move(panel));
+            }
+            wz::script::clear_pending_stats_panels(state.scripts);
+        }
+
+        {
+            const std::size_t count =
+                wz::script::pending_button_panel_count(state.scripts);
+
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                const char* t = wz::script::pending_button_panel_title(state.scripts, i, nullptr);
+                if (t == nullptr || t[0] == '\0') continue;
+
+                ToolhostState::ScriptButtonPanel panel;
+                panel.title = copy_panel_str(t);
+
+                const std::size_t btn_count =
+                    wz::script::pending_button_panel_button_count(state.scripts, i);
+
+                for (std::size_t b = 0; b < btn_count; ++b)
+                {
+                    const char* l = wz::script::pending_button_panel_button_label(state.scripts, i, b, nullptr);
+                    const char* a = wz::script::pending_button_panel_button_action(state.scripts, i, b, nullptr);
+                    panel.buttons.emplace_back(copy_panel_str(l), copy_panel_str(a));
+                }
+                upsert_script_panel(state.script_button_panels, std::move(panel));
+            }
+            wz::script::clear_pending_button_panels(state.scripts);
+        }
+
+        {
+            const std::size_t count = wz::script::log_count(state.scripts);
+            for (std::size_t i = 0; i < count; ++i)
+            {
+                const char* m = wz::script::log_message(state.scripts, i, nullptr);
+                if (m != nullptr && m[0] != '\0')
+                    state.console.push_string(std::string("[script] ") + m);
+            }
+            wz::script::clear_logs(state.scripts);
+        }
+    }
+
+    void draw_script_panels(ToolhostState& state)
+    {
+        float script_panel_x = 560.0f;
+        float script_panel_y = 24.0f;
+
+        for (const auto& panel : state.script_text_panels)
+        {
+            ImGui::SetNextWindowPos(ImVec2(script_panel_x, script_panel_y), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(300.0f, 120.0f), ImGuiCond_FirstUseEver);
+            ImGui::Begin(panel.title.c_str());
+            script_panel_y += 140.0f;
+            ImGui::TextUnformatted(
+                panel.text.c_str(),
+                panel.text.c_str() + panel.text.size());
+            ImGui::End();
+        }
+
+        for (const auto& panel : state.script_stats_panels)
+        {
+            ImGui::SetNextWindowPos(ImVec2(script_panel_x, script_panel_y), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(300.0f, 200.0f), ImGuiCond_FirstUseEver);
+            ImGui::Begin(panel.title.c_str());
+            script_panel_y += 220.0f;
+            if (ImGui::BeginTable(
+                panel.title.c_str(), 2,
+                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
+            {
+                ImGui::TableSetupColumn("Field");
+                ImGui::TableSetupColumn("Value");
+                ImGui::TableHeadersRow();
+                for (const auto& [label, value] : panel.rows)
+                {
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::TextUnformatted(label.c_str());
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextUnformatted(value.c_str());
+                }
+                ImGui::EndTable();
+            }
+            ImGui::End();
+        }
+
+        for (auto& panel : state.script_button_panels)
+        {
+            ImGui::SetNextWindowPos(ImVec2(script_panel_x, script_panel_y), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize(ImVec2(240.0f, 160.0f), ImGuiCond_FirstUseEver);
+            ImGui::Begin(panel.title.c_str());
+            script_panel_y += 180.0f;
+            for (const auto& [label, action] : panel.buttons)
+            {
+                if (ImGui::Button(label.c_str()))
+                    state.console.push_string("[script action] " + action);
+            }
+            ImGui::End();
+        }
+    }
+
+#endif // WOZZITS_ENABLE_V8_SCRIPTING
 
     ID3D12DescriptorHeap* create_imgui_srv_heap(ID3D12Device* device)
     {
@@ -643,6 +848,11 @@ namespace
         draw_benchmark_panel(state, fctx);
         draw_console_panel(state);
 
+#ifdef WOZZITS_ENABLE_V8_SCRIPTING
+        if (state.scripts != nullptr)
+            draw_script_panels(state);
+#endif
+
         ImGui::Render();
 
         ImDrawData* draw_data =
@@ -706,6 +916,11 @@ namespace
             fctx,
             state->app);
 
+#ifdef WOZZITS_ENABLE_V8_SCRIPTING
+        if (state->scripts != nullptr)
+            drain_script_panels(*state);
+#endif
+
         if (!ctx.running)
             return;
 
@@ -766,10 +981,58 @@ int main()
         return 1;
     }
 
+#ifdef WOZZITS_ENABLE_V8_SCRIPTING
+    if (!wz::script::init_v8_platform())
+    {
+        std::cerr << "failed to initialize V8 platform\n";
+        shutdown_imgui(state);
+        wz::app::shutdown(state.app);
+        g_toolhost_state = nullptr;
+        return 1;
+    }
+
+    state.scripts = wz::script::create_v8_script_host();
+
+    if (state.scripts == nullptr || !wz::script::initialize(state.scripts))
+    {
+        std::cerr << "failed to initialize script host\n";
+        wz::script::destroy_v8_script_host(state.scripts);
+        wz::script::shutdown_v8_platform();
+        shutdown_imgui(state);
+        wz::app::shutdown(state.app);
+        g_toolhost_state = nullptr;
+        return 1;
+    }
+
+    {
+        static constexpr const char* k_startup_script =
+            "wz.log('wozzits toolhost script host online');"
+            "wz.tool.textPanel('Script Console', 'V8 scripting host is running.');"
+            "wz.tool.statsPanel('Script Info', ["
+            "  ['status', 'running'],"
+            "  ['host',   'wozzits-toolhost']"
+            "]);"
+            "wz.tool.buttonPanel('Script Tools', ["
+            "  ['Reload scripts',  'scripts.reload'],"
+            "  ['Clear logs',      'scripts.clear_logs']"
+            "]);"
+            "'startup ok';";
+
+        wz::script::run_source(state.scripts, "startup.js", k_startup_script);
+        drain_script_panels(state);
+    }
+#endif
+
     wz::engine::run(
         toolhost_update,
         &state);
 
+
+#ifdef WOZZITS_ENABLE_V8_SCRIPTING
+    wz::script::destroy_v8_script_host(state.scripts);
+    state.scripts = nullptr;
+    wz::script::shutdown_v8_platform();
+#endif
 
     shutdown_imgui(state);
 
