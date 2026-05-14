@@ -2,8 +2,15 @@
 #define NOMINMAX
 #include <Windows.h>
 
+#include <mutex>
+#include <string>
+#include <vector>
+
 #include <engine/engine.h>
 #include <engine/game_app.h>
+
+#include <logging/logging.h>
+#include <logging/logger.h>
 
 #include <window/window2.h>
 
@@ -15,6 +22,8 @@
 #include <imgui.h>
 #include <backends/imgui_impl_win32.h>
 #include <backends/imgui_impl_dx12.h>
+
+#include <engine/game_app_benchmark.h>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
     HWND hWnd,
@@ -120,12 +129,60 @@ namespace
         }
     };
 
+    struct ConsoleLine
+    {
+        wz::LogLevel level = wz::LogLevel::Info;
+        uint64_t sequence = 0;
+        uint64_t event_ticks = 0;
+        std::string text;
+    };
+
+    struct ToolConsole
+    {
+        std::mutex mutex;
+        std::vector<ConsoleLine> lines;
+        bool auto_scroll = true;
+        bool scroll_to_bottom = false;
+
+        void push(const wz::logging::LogRecordView& record)
+        {
+            if (record.text == nullptr)
+                return;
+
+            std::lock_guard lock(mutex);
+
+            lines.push_back(ConsoleLine{
+                .level = record.level,
+                .sequence = record.sequence,
+                .event_ticks = record.event_ticks,
+                .text = std::string(
+                    record.text,
+                    record.text + record.text_size),
+                });
+
+            constexpr std::size_t kMaxLines = 4000;
+
+            if (lines.size() > kMaxLines)
+            {
+                lines.erase(
+                    lines.begin(),
+                    lines.begin()
+                    + static_cast<std::ptrdiff_t>(
+                        lines.size() - kMaxLines));
+            }
+
+            scroll_to_bottom = true;
+        }
+    };
+
     struct ToolhostState
     {
         wz::app::GameApp app{};
 
         ID3D12DescriptorHeap* imgui_srv_heap = nullptr;
         ImGuiDx12SrvAllocator imgui_srv_allocator{};
+
+        ToolConsole console{};
 
         bool imgui_ready = false;
     };
@@ -184,7 +241,18 @@ namespace
             return false;
 
         ImGuiIO& io = ImGui::GetIO();
+
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+        io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+
+        ImGuiStyle& style = ImGui::GetStyle();
+
+        if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
+        {
+            style.WindowRounding = 0.0f;
+            style.Colors[ImGuiCol_WindowBg].w = 0.85f;
+        }
 
         ImGui::StyleColorsDark();
 
@@ -307,6 +375,223 @@ namespace
         ImGui::NewFrame();
     }
 
+    const char* log_level_name(wz::LogLevel level)
+    {
+        switch (level)
+        {
+        case wz::LogLevel::Debug:
+            return "DEBUG";
+
+        case wz::LogLevel::Info:
+            return "INFO";
+
+        case wz::LogLevel::Warning:
+            return "WARN";
+
+        case wz::LogLevel::Error:
+            return "ERROR";
+
+        case wz::LogLevel::Critical:
+            return "CRITICAL";
+        }
+
+        return "UNKNOWN";
+    }
+
+    void draw_console_panel(ToolhostState& state)
+    {
+        ImGui::SetNextWindowSize(
+            ImVec2(760.0f, 360.0f),
+            ImGuiCond_FirstUseEver);
+
+        ImGui::SetNextWindowBgAlpha(0.85f);
+
+        ImGui::Begin("Wozzits Console");
+
+        if (ImGui::Button("Clear"))
+        {
+            std::lock_guard lock(state.console.mutex);
+            state.console.lines.clear();
+            state.console.scroll_to_bottom = false;
+        }
+
+        ImGui::SameLine();
+
+        ImGui::Checkbox(
+            "Auto-scroll",
+            &state.console.auto_scroll);
+
+        ImGui::Separator();
+
+        if (ImGui::BeginChild(
+            "console_scroll",
+            ImVec2(0.0f, 0.0f),
+            true,
+            ImGuiWindowFlags_HorizontalScrollbar))
+        {
+            std::lock_guard lock(state.console.mutex);
+
+            for (const ConsoleLine& line : state.console.lines)
+            {
+                ImGui::Text("[%s]", log_level_name(line.level));
+                ImGui::SameLine();
+                ImGui::TextUnformatted(line.text.c_str());
+            }
+
+            if (state.console.auto_scroll && state.console.scroll_to_bottom)
+            {
+                ImGui::SetScrollHereY(1.0f);
+                state.console.scroll_to_bottom = false;
+            }
+        }
+
+        ImGui::EndChild();
+        ImGui::End();
+    }
+
+    void draw_benchmark_panel(
+        const ToolhostState& state,
+        const wz::engine::FrameContext& fctx)
+    {
+        const wz::app::GameAppBenchmarkSnapshot snap =
+            wz::app::benchmark_snapshot(
+                state.app,
+                fctx);
+
+        ImGui::SetNextWindowPos(
+            ImVec2(24.0f, 24.0f),
+            ImGuiCond_FirstUseEver);
+
+        ImGui::SetNextWindowSize(
+            ImVec2(520.0f, 420.0f),
+            ImGuiCond_FirstUseEver);
+
+        ImGui::SetNextWindowBgAlpha(0.85f);
+
+        ImGui::Begin("Wozzits Benchmark");
+
+        ImGui::Text("Scene compiler / culler benchmark");
+        ImGui::Separator();
+
+        if (ImGui::CollapsingHeader("Frame", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::Text(
+                "Frame: %llu",
+                static_cast<unsigned long long>(snap.frame_index));
+
+            ImGui::Text(
+                "dt: %.4f ms",
+                snap.dt_seconds * 1000.0);
+
+            ImGui::Text(
+                "FPS: %.1f",
+                snap.fps);
+        }
+
+        if (ImGui::CollapsingHeader("Scene", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::Text(
+                "Debug object ready: %s",
+                snap.debug_object_ready ? "yes" : "no");
+
+            ImGui::Text(
+                "Compiled scene valid: %s",
+                snap.compiled_scene_valid ? "yes" : "no");
+
+            ImGui::Text(
+                "Scene nodes: %llu",
+                static_cast<unsigned long long>(snap.scene_nodes));
+
+            ImGui::Text(
+                "Dirty transform nodes: %llu",
+                static_cast<unsigned long long>(snap.dirty_nodes));
+        }
+
+        if (ImGui::CollapsingHeader("Jobs", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::Text("Total jobs: %u", snap.job_count);
+            ImGui::Text("Total job time: %.3f ms", snap.total_job_ms);
+            ImGui::Text("Render prep time: %.3f ms", snap.render_prep_job_ms);
+            ImGui::Text(
+                "Slowest: %s %.3f ms",
+                snap.slowest_job_name ? snap.slowest_job_name : "<none>",
+                snap.slowest_job_ms);
+
+            ImGui::Separator();
+
+            if (ImGui::BeginTable("job timings", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
+            {
+                ImGui::TableSetupColumn("Job");
+                ImGui::TableSetupColumn("ms");
+                ImGui::TableHeadersRow();
+
+                for (uint32_t i = 0; i < snap.job_count; ++i)
+                {
+                    ImGui::TableNextRow();
+
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::TextUnformatted(
+                        snap.jobs[i].name ? snap.jobs[i].name : "<unnamed>");
+
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::Text("%.3f", snap.jobs[i].ms);
+                }
+
+                ImGui::EndTable();
+            }
+        }
+
+        if (ImGui::CollapsingHeader("Render prep", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::Text(
+                "Path: %s",
+                snap.render_prep_path ? snap.render_prep_path : "Unknown");
+        }
+
+        if (ImGui::CollapsingHeader("Render commands", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::Text(
+                "Opaque: %llu",
+                static_cast<unsigned long long>(snap.opaque_commands));
+
+            ImGui::Text(
+                "Splats: %llu",
+                static_cast<unsigned long long>(snap.splat_commands));
+
+            ImGui::Text(
+                "Transparent: %llu",
+                static_cast<unsigned long long>(snap.transparent_commands));
+
+            ImGui::Text(
+                "Particles: %llu",
+                static_cast<unsigned long long>(snap.particle_commands));
+
+            ImGui::Separator();
+
+            ImGui::Text(
+                "Total: %llu",
+                static_cast<unsigned long long>(snap.total_commands));
+        }
+
+        if (ImGui::CollapsingHeader("Frame allocations", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::Text(
+                "Owned bytes: %llu",
+                static_cast<unsigned long long>(snap.bytes_owned));
+
+            ImGui::Text(
+                "Allocated this frame: %llu",
+                static_cast<unsigned long long>(
+                    snap.bytes_allocated_this_frame));
+
+            ImGui::Text(
+                "Reallocations this frame: %u",
+                snap.reallocations_this_frame);
+        }
+
+        ImGui::End();
+    }
+
     void draw_toolhost_panel(
         const ToolhostState& state,
         const wz::engine::FrameContext& fctx)
@@ -355,7 +640,8 @@ namespace
 
         begin_imgui_frame(state, fctx);
 
-        draw_toolhost_panel(state, fctx);
+        draw_benchmark_panel(state, fctx);
+        draw_console_panel(state);
 
         ImGui::Render();
 
@@ -395,6 +681,14 @@ namespace
         ImGui_ImplDX12_RenderDrawData(
             draw_data,
             cmd);
+
+        ImGuiIO& io = ImGui::GetIO();
+
+        if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable)
+        {
+            ImGui::UpdatePlatformWindows();
+            ImGui::RenderPlatformWindowsDefault();
+        }
     }
 
     void toolhost_update(
@@ -431,6 +725,10 @@ namespace
             *state,
             fctx);
 
+
+
+
+
         wz::gpu::end_frame(state->app.ctx.device);
         wz::gpu::present(state->app.ctx.device);
     }
@@ -447,6 +745,19 @@ int main()
         return 1;
     }
 
+    wz::logging::set_log_sink(
+        state.app.ctx.logger,
+        [](const wz::logging::LogRecordView& record, void* user)
+        {
+            auto* state = static_cast<ToolhostState*>(user);
+
+            if (!state)
+                return;
+
+            state->console.push(record);
+        },
+        &state);
+
     if (!init_imgui_for_app(state))
     {
         shutdown_imgui(state);
@@ -459,7 +770,15 @@ int main()
         toolhost_update,
         &state);
 
+
     shutdown_imgui(state);
+
+    wz::logging::set_log_sink(
+        state.app.ctx.logger,
+        nullptr,
+        nullptr);
+
+    wz::logging::wait_until_idle(state.app.ctx.logger);
 
     wz::app::shutdown(state.app);
 
