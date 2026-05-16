@@ -39,6 +39,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(
 
 #include <cassert>
 #include <cstdint>
+#include <ctime>
 #include <iostream>
 
 namespace
@@ -141,6 +142,37 @@ namespace
         std::string text;
     };
 
+    struct FrameRecord
+    {
+        uint32_t frame                       = 0;
+        double   dt_ms                       = 0.0;
+        double   fps                         = 0.0;
+        double   total_job_ms                = 0.0;
+        double   render_prep_job_ms          = 0.0;
+        double   slowest_job_ms              = 0.0;
+        uint64_t opaque_commands             = 0;
+        uint64_t splat_commands              = 0;
+        uint64_t transparent_commands        = 0;
+        uint64_t particle_commands           = 0;
+        uint64_t total_commands              = 0;
+        uint64_t bytes_owned                 = 0;
+        uint64_t bytes_allocated_this_frame  = 0;
+        uint32_t reallocations_this_frame    = 0;
+        uint64_t scene_nodes                 = 0;
+        uint64_t dirty_nodes                 = 0;
+        uint64_t debug_renderables           = 0;
+        uint32_t debug_object_ready          = 0;
+        uint32_t compiled_scene_valid        = 0;
+    };
+
+    struct DiagRecorder
+    {
+        bool     recording     = false;
+        int      bucket_frames = 60;
+        std::vector<FrameRecord> frames;
+        std::string last_status;
+    };
+
     struct ToolConsole
     {
         std::mutex mutex;
@@ -196,7 +228,8 @@ namespace
         ID3D12DescriptorHeap* imgui_srv_heap = nullptr;
         ImGuiDx12SrvAllocator imgui_srv_allocator{};
 
-        ToolConsole console{};
+        ToolConsole  console{};
+        DiagRecorder diag_recorder{};
 
         bool imgui_ready = false;
 
@@ -693,14 +726,203 @@ namespace
         ImGui::End();
     }
 
+    void export_benchmark_recording(ToolhostState& state)
+    {
+        DiagRecorder& rec = state.diag_recorder;
+
+        if (rec.frames.empty()) {
+            rec.last_status = "No frames recorded.";
+            return;
+        }
+
+        if (!state.app.ctx.assets) {
+            rec.last_status = "Asset library not available.";
+            return;
+        }
+
+        wz::engine::assets::EngineAssetLibrary assets{
+            state.app.ctx.device,
+            state.app.ctx.logger,
+            ".",
+        };
+
+        // ── Build DataTableData ───────────────────────────────────────────────────
+        using wz::engine::assets::DataTableData;
+        using wz::engine::assets::DataTableColumn;
+        using wz::engine::assets::DataTableRow;
+
+        DataTableData table;
+        for (const char* col : {
+            "frame",
+            "dt_ms", "fps",
+            "total_job_ms", "render_prep_job_ms", "slowest_job_ms",
+            "opaque_commands", "splat_commands", "transparent_commands",
+            "particle_commands", "total_commands",
+            "bytes_owned", "bytes_allocated", "reallocations",
+            "scene_nodes", "dirty_nodes", "debug_renderables",
+            "debug_object_ready", "compiled_scene_valid",
+        }) {
+            table.columns.push_back({ .name = col });
+        }
+
+        char buf[32];
+        auto ds = [&](double v) -> std::string {
+            std::snprintf(buf, sizeof(buf), "%.6g", v);
+            return buf;
+        };
+
+        for (const FrameRecord& f : rec.frames) {
+            table.rows.push_back({ .cells = {
+                std::to_string(f.frame),
+                ds(f.dt_ms), ds(f.fps),
+                ds(f.total_job_ms), ds(f.render_prep_job_ms), ds(f.slowest_job_ms),
+                std::to_string(f.opaque_commands),
+                std::to_string(f.splat_commands),
+                std::to_string(f.transparent_commands),
+                std::to_string(f.particle_commands),
+                std::to_string(f.total_commands),
+                std::to_string(f.bytes_owned),
+                std::to_string(f.bytes_allocated_this_frame),
+                std::to_string(f.reallocations_this_frame),
+                std::to_string(f.scene_nodes),
+                std::to_string(f.dirty_nodes),
+                std::to_string(f.debug_renderables),
+                std::to_string(f.debug_object_ready),
+                std::to_string(f.compiled_scene_valid),
+            }});
+        }
+
+        // ── Register assets ───────────────────────────────────────────────────────
+        const uint32_t last = rec.frames.back().frame;
+
+        const auto source = assets.data_tables().create_inline_table({
+            .name  = "bench/recording/raw",
+            .table = std::move(table),
+        });
+
+        if (!source.valid()) {
+            rec.last_status = "Failed to create source table.";
+            return;
+        }
+
+        const std::vector<std::string> metrics = {
+            "dt_ms", "fps",
+            "total_job_ms", "render_prep_job_ms", "slowest_job_ms",
+            "opaque_commands", "splat_commands", "transparent_commands",
+            "particle_commands", "total_commands",
+            "bytes_owned", "bytes_allocated", "reallocations",
+            "scene_nodes", "dirty_nodes", "debug_renderables",
+            "debug_object_ready", "compiled_scene_valid",
+        };
+
+        const auto summary = assets.diagnostic_timeframe_summaries().create_timeframe_summary({
+            .name              = "bench/recording/summary",
+            .source            = source,
+            .frame_column      = "frame",
+            .metric_columns    = metrics,
+            .frame_start       = 0,
+            .frame_end         = last,
+            .frames_per_bucket = static_cast<uint32_t>(
+                rec.bucket_frames > 0 ? rec.bucket_frames : 0),
+        });
+
+        if (!summary.valid()) {
+            rec.last_status = "Failed to create summary.";
+            return;
+        }
+
+        const auto view = assets.diagnostic_timeframe_summaries().create_data_table_view(
+            "bench/recording/view", summary);
+
+        if (!view.valid()) {
+            rec.last_status = "Failed to create table view.";
+            return;
+        }
+
+        const auto csv_asset = assets.csv_export().create_csv_export({
+            .name   = "bench/recording/csv",
+            .source = view,
+        });
+
+        if (!csv_asset.valid()) {
+            rec.last_status = "Failed to create CSV export.";
+            return;
+        }
+
+        // ── Compile ───────────────────────────────────────────────────────────────
+        if (!assets.commit()) {
+            rec.last_status = "Asset commit failed.";
+            return;
+        }
+
+        const auto report = assets.resolve_all();
+        if (!report.ok()) {
+            rec.last_status = "Resolve failed ("
+                + std::to_string(report.failures.size()) + " errors).";
+            return;
+        }
+
+        const auto csv_handle = assets.csv_export().get_export(csv_asset);
+        if (!csv_handle.valid()) {
+            rec.last_status = "CSV export handle invalid after resolve.";
+            return;
+        }
+
+        // ── Write file ────────────────────────────────────────────────────────────
+        std::time_t now = std::time(nullptr);
+        std::tm     tm_now{};
+        ::localtime_s(&tm_now, &now);
+        char timestamp[32];
+        std::strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &tm_now);
+
+        const std::string path =
+            std::string("benchmark_") + timestamp + ".csv";
+
+        const wz::fs::FileError err =
+            assets.csv_export().write_export_to_file(csv_handle, path);
+
+        if (err != wz::fs::FileError::None) {
+            rec.last_status = "Write failed: " + path;
+        } else {
+            rec.last_status = "Exported: " + path;
+            state.console.push_string("[bench] " + rec.last_status);
+        }
+    }
+
     void draw_benchmark_panel(
-        const ToolhostState& state,
+        ToolhostState& state,
         const wz::engine::FrameContext& fctx)
     {
         const wz::app::GameAppBenchmarkSnapshot snap =
             wz::app::benchmark_snapshot(
                 state.app,
                 fctx);
+
+        if (state.diag_recorder.recording) {
+            const uint32_t idx =
+                static_cast<uint32_t>(state.diag_recorder.frames.size());
+            state.diag_recorder.frames.push_back(FrameRecord{
+                .frame                      = idx,
+                .dt_ms                      = snap.dt_seconds * 1000.0,
+                .fps                        = snap.fps,
+                .total_job_ms               = snap.total_job_ms,
+                .render_prep_job_ms         = snap.render_prep_job_ms,
+                .slowest_job_ms             = snap.slowest_job_ms,
+                .opaque_commands            = snap.opaque_commands,
+                .splat_commands             = snap.splat_commands,
+                .transparent_commands       = snap.transparent_commands,
+                .particle_commands          = snap.particle_commands,
+                .total_commands             = snap.total_commands,
+                .bytes_owned                = snap.bytes_owned,
+                .bytes_allocated_this_frame = snap.bytes_allocated_this_frame,
+                .reallocations_this_frame   = snap.reallocations_this_frame,
+                .scene_nodes                = snap.scene_nodes,
+                .dirty_nodes                = snap.dirty_nodes,
+                .debug_renderables          = snap.debug_renderables,
+                .debug_object_ready         = snap.debug_object_ready  ? 1u : 0u,
+                .compiled_scene_valid       = snap.compiled_scene_valid ? 1u : 0u,
+            });
+        }
 
         ImGui::SetNextWindowPos(
             ImVec2(24.0f, 24.0f),
@@ -831,6 +1053,44 @@ namespace
             ImGui::Text(
                 "Reallocations this frame: %u",
                 snap.reallocations_this_frame);
+        }
+
+        if (ImGui::CollapsingHeader("Record / Export"))
+        {
+            DiagRecorder& rec = state.diag_recorder;
+
+            ImGui::SetNextItemWidth(140.0f);
+            ImGui::InputInt("Frames per bucket", &rec.bucket_frames);
+            if (rec.bucket_frames < 0)
+                rec.bucket_frames = 0;
+
+            if (!rec.recording) {
+                if (ImGui::Button("Record")) {
+                    rec.recording = true;
+                    rec.frames.clear();
+                    rec.last_status.clear();
+                }
+            } else {
+                ImGui::TextUnformatted("Recording");
+                ImGui::SameLine();
+                ImGui::Text("(%zu frames)", rec.frames.size());
+
+                if (ImGui::Button("Stop & Export")) {
+                    rec.recording = false;
+                    export_benchmark_recording(state);
+                }
+
+                ImGui::SameLine();
+
+                if (ImGui::Button("Cancel")) {
+                    rec.recording = false;
+                    rec.frames.clear();
+                    rec.last_status = "Cancelled.";
+                }
+            }
+
+            if (!rec.last_status.empty())
+                ImGui::TextUnformatted(rec.last_status.c_str());
         }
 
         ImGui::End();
