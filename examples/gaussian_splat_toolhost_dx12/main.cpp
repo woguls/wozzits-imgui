@@ -119,7 +119,7 @@ namespace
                 .name        = "splat/debug_sphere",
                 .count       = 4096,
                 .radius      = 1.5f,
-                .splat_scale = 0.05f,
+                .splat_scale = 1.05f,
             });
         if (!splat_cloud.valid())
             return false;
