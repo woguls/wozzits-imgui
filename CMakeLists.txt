@@ -142,6 +142,7 @@ if(WOZZITS_IMGUI_BUILD_EXAMPLES)
     add_subdirectory(examples/wozzits_toolhost_dx12)
     add_subdirectory(examples/mesh_asset_tool_dx12)
     add_subdirectory(examples/scalar_field_tool_dx12)
+    add_subdirectory(examples/mesh_wireframe_toolhost_dx12)
 
 endif()
 

@@ -245,8 +245,8 @@ namespace wz::toolhost
     }
 
     void ImGuiDx12ToolhostContext::begin_frame(
-        wz::gpu::Device&                device,
-        const wz::engine::FrameContext& fctx)
+        wz::gpu::Device& device,
+        float            delta_seconds)
     {
         ImGui_ImplDX12_NewFrame();
         ImGui_ImplWin32_NewFrame();
@@ -257,10 +257,16 @@ namespace wz::toolhost
             static_cast<float>(wz::gpu::dx12::internal::get_width(device)),
             static_cast<float>(wz::gpu::dx12::internal::get_height(device)));
 
-        const double dt = fctx.frame.delta_seconds();
-        io.DeltaTime = dt > 0.0 ? static_cast<float>(dt) : (1.0f / 60.0f);
+        io.DeltaTime = delta_seconds > 0.0f ? delta_seconds : (1.0f / 60.0f);
 
         ImGui::NewFrame();
+    }
+
+    void ImGuiDx12ToolhostContext::begin_frame(
+        wz::gpu::Device&                device,
+        const wz::engine::FrameContext& fctx)
+    {
+        begin_frame(device, static_cast<float>(fctx.frame.delta_seconds()));
     }
 
     void ImGuiDx12ToolhostContext::render(wz::gpu::Device& device)

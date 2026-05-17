@@ -37,6 +37,10 @@ namespace wz::toolhost
             wz::window::WindowHandle window);
 
         void begin_frame(
+            wz::gpu::Device& device,
+            float            delta_seconds);
+
+        void begin_frame(
             wz::gpu::Device&                device,
             const wz::engine::FrameContext& fctx);
 
