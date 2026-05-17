@@ -8,7 +8,7 @@
 #include <engine/assets/gaussian_splat_asset_module.h>
 #include <engine/assets/renderable_asset_module.h>
 #include <engine/rendering/renderable_gpu_cache.h>
-#include <engine/rendering/renderable_debug_runtime.h>
+#include <engine/rendering/renderable_pipeline_cache.h>
 #include <engine/rendering/builtin_render_programs.h>
 #include <engine/rendering/render_resource_resolver.h>
 
@@ -121,9 +121,9 @@ namespace
         wz::toolhost::ToolConsole              console{};
         wz::toolhost::BenchmarkRecorder        recorder{};
 
-        wz::engine::rendering::RenderableGpuCache   renderable_cache{};
-        wz::engine::rendering::DebugRenderableSetup  debug_setup{};
-        wz::engine::rendering::RenderResourceResolver resolver{};
+        wz::engine::rendering::RenderableGpuCache    renderable_cache{};
+        wz::engine::rendering::RenderablePipelineCache pipeline_cache{};
+        wz::engine::rendering::RenderResourceResolver  resolver{};
 
         wz::scene::SplatHandle splat_handle{ wz::scene::INVALID_SPLAT };
 
@@ -175,22 +175,22 @@ namespace
         if (!report.ok())
             return false;
 
-        // Uploads splat cloud to GPU and creates the gaussian splat debug PSO.
-        // The PSO is reused by the resolver-based submit path (Track A).
-        if (!setup_debug_renderable_context(
-                state.ctx.device,
-                assets,
-                state.renderable_cache,
-                renderable,
-                shaders,
-                state.debug_setup))
+        // Realize GPU resources and pipeline.
+        const auto handle   = assets.renderables().get_renderable(renderable);
+        const auto prepared = state.renderable_cache.realize(
+            state.ctx.device, assets, handle);
+        if (!prepared.valid())
             return false;
 
-        // Register the GPU resource with the resolver.
+        if (!state.pipeline_cache.realize(
+                state.ctx.device, assets, prepared.program, shaders))
+            return false;
+
+        // Register the GPU resource with the resolver (program stored alongside).
         // The returned SplatHandle goes into DrawCommand::splats_buffer each frame.
         state.splat_handle =
             state.resolver.register_splat_cloud(
-                state.debug_setup.prepared.gpu_resource);
+                prepared.gpu_resource, prepared.program);
 
         return true;
     }
@@ -217,8 +217,9 @@ namespace
         frame.splats               = std::span<const wz::render::DrawCommand>(&cmd, 1);
         frame.view.view_projection = make_view_proj(state.camera, w, h);
 
-        // Track A submit: resolver maps SplatHandle → GPUHandle at draw time.
-        wz::gpu::dx12::submit_render_frame(state.ctx.device, frame, state.resolver);
+        // Track A submit: resolver maps SplatHandle → GPUHandle + program at draw time.
+        wz::gpu::dx12::submit_render_frame(
+            state.ctx.device, frame, state.resolver, state.pipeline_cache);
     }
 
 

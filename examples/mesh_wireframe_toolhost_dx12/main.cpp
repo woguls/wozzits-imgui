@@ -9,7 +9,7 @@
 #include <engine/assets/mesh_asset_module.h>
 #include <engine/assets/renderable_asset_module.h>
 #include <engine/rendering/renderable_gpu_cache.h>
-#include <engine/rendering/renderable_debug_runtime.h>
+#include <engine/rendering/renderable_pipeline_cache.h>
 #include <engine/rendering/builtin_render_programs.h>
 #include <engine/rendering/render_resource_resolver.h>
 
@@ -123,9 +123,9 @@ namespace
         wz::toolhost::ToolConsole              console{};
         wz::toolhost::BenchmarkRecorder        recorder{};
 
-        wz::engine::rendering::RenderableGpuCache   renderable_cache{};
-        wz::engine::rendering::DebugRenderableSetup debug_setup{};
-        wz::engine::rendering::RenderResourceResolver resolver{};
+        wz::engine::rendering::RenderableGpuCache     renderable_cache{};
+        wz::engine::rendering::RenderablePipelineCache pipeline_cache{};
+        wz::engine::rendering::RenderResourceResolver  resolver{};
 
         wz::scene::MeshHandle mesh_handle{ wz::scene::INVALID_MESH };
 
@@ -175,17 +175,19 @@ namespace
         if (!report.ok())
             return false;
 
-        if (!setup_debug_renderable_context(
-                state.ctx.device,
-                assets,
-                state.renderable_cache,
-                renderable,
-                shaders,
-                state.debug_setup))
+        // Realize GPU resources and pipeline.
+        const auto handle   = assets.renderables().get_renderable(renderable);
+        const auto prepared = state.renderable_cache.realize(
+            state.ctx.device, assets, handle);
+        if (!prepared.valid())
+            return false;
+
+        if (!state.pipeline_cache.realize(
+                state.ctx.device, assets, prepared.program, shaders))
             return false;
 
         state.mesh_handle =
-            state.resolver.register_mesh(state.debug_setup.prepared.gpu_resource);
+            state.resolver.register_mesh(prepared.gpu_resource, prepared.program);
 
         return true;
     }
@@ -210,7 +212,8 @@ namespace
         frame.opaque               = std::span<const wz::render::DrawCommand>(&cmd, 1);
         frame.view.view_projection = make_view_proj(state.camera, w, h);
 
-        wz::gpu::dx12::submit_render_frame(state.ctx.device, frame, state.resolver);
+        wz::gpu::dx12::submit_render_frame(
+            state.ctx.device, frame, state.resolver, state.pipeline_cache);
     }
 
 
