@@ -8,6 +8,8 @@
 #include <engine/assets/mesh/mesh.h>
 #include <engine/assets/mesh_asset_module.h>
 #include <engine/assets/renderable_asset_module.h>
+#include <engine/assets/schema_ids.h>
+#include <engine/assets/type_extensions.h>
 #include <engine/rendering/renderable_gpu_cache.h>
 #include <engine/rendering/renderable_pipeline_cache.h>
 #include <engine/rendering/builtin_render_programs.h>
@@ -114,25 +116,35 @@ namespace
 
         EngineAssetLibrary& assets = *state.ctx.assets;
 
-        MeshAsset mesh = assets.meshes().create_procedural_mesh({
-            .name = "wireframe/cube",
-            .kind = ProceduralMeshKind::Cube,
-        });
+        const wz::asset::AssetKey rock_file =
+            assets.files().register_file_node(
+                "gltf/low_poly_rock.glb",
+                kRawFileSchema,
+                kAssetTypeRawFile);
+
+        if (rock_file == wz::asset::AssetKey{})
+            return false;
+
+        MeshAsset mesh = assets.meshes().create_glb_mesh({
+            .name = "wireframe/low_poly_rock",
+            .source_file = rock_file,
+            .mesh_index = 0,
+            });
 
         if (!mesh.valid())
             return false;
 
         RenderableAsset renderable = assets.renderables().create_mesh_wireframe({
-            .name = "wireframe/cube_renderable",
+            .name = "wireframe/low_poly_rock_renderable",
             .mesh = mesh,
-        });
+            });
 
         if (!renderable.valid())
             return false;
 
         ShaderPairDesc shader_desc{};
         if (!get_builtin_shader_pair_desc(
-                BuiltinRenderProgram::MeshWireframeDebug, shader_desc))
+            BuiltinRenderProgram::MeshWireframeDebug, shader_desc))
             return false;
 
         ShaderPairAsset shaders = assets.shaders().create_shader_pair(shader_desc);
@@ -148,14 +160,15 @@ namespace
             return false;
 
         // Realize GPU resources and pipeline.
-        const auto handle   = assets.renderables().get_renderable(renderable);
+        const auto handle = assets.renderables().get_renderable(renderable);
         const auto prepared = state.renderable_cache.realize(
             state.ctx.device, assets, handle);
+
         if (!prepared.valid())
             return false;
 
         if (!state.pipeline_cache.realize(
-                state.ctx.device, assets, prepared.program, shaders))
+            state.ctx.device, assets, prepared.program, shaders))
             return false;
 
         state.mesh_handle =
