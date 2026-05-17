@@ -22,6 +22,8 @@
 #include <scene/compile/compiled_scene.h>
 
 #include <math/mat4.h>
+#include <math/vec3.h>
+#include <math/camera.h>
 #include <math/projection.h>
 
 #include <logging/logging.h>
@@ -73,38 +75,8 @@ namespace
             target.z - cam.distance * cp * cy,
         };
 
-        // look-at (DX convention: z-forward into screen)
-        auto sub = [](const wz::math::Vec3& a, const wz::math::Vec3& b) {
-            return wz::math::Vec3{ a.x - b.x, a.y - b.y, a.z - b.z };
-        };
-        auto dot = [](const wz::math::Vec3& a, const wz::math::Vec3& b) {
-            return a.x * b.x + a.y * b.y + a.z * b.z;
-        };
-        auto cross = [](const wz::math::Vec3& a, const wz::math::Vec3& b) {
-            return wz::math::Vec3{
-                a.y * b.z - a.z * b.y,
-                a.z * b.x - a.x * b.z,
-                a.x * b.y - a.y * b.x,
-            };
-        };
-        auto normalize = [&](const wz::math::Vec3& v) {
-            const float len = std::sqrt(dot(v, v));
-            const float inv = len > 1e-6f ? 1.0f / len : 1.0f;
-            return wz::math::Vec3{ v.x * inv, v.y * inv, v.z * inv };
-        };
-
-        const wz::math::Vec3 z = normalize(sub(target, eye));
-        const wz::math::Vec3 x = normalize(cross(wz::math::Vec3{0,1,0}, z));
-        const wz::math::Vec3 y = cross(z, x);
-
-        wz::math::Mat4 view = wz::math::mat4_identity();
-        view.m[0]  = x.x;  view.m[1]  = y.x;  view.m[2]  = z.x;  view.m[3]  = 0.f;
-        view.m[4]  = x.y;  view.m[5]  = y.y;  view.m[6]  = z.y;  view.m[7]  = 0.f;
-        view.m[8]  = x.z;  view.m[9]  = y.z;  view.m[10] = z.z;  view.m[11] = 0.f;
-        view.m[12] = -dot(x, eye);
-        view.m[13] = -dot(y, eye);
-        view.m[14] = -dot(z, eye);
-        view.m[15] = 1.f;
+        const wz::math::Mat4 view =
+            wz::math::look_at_dx(eye, target, { 0.f, 1.f, 0.f });
 
         const wz::math::Mat4 proj =
             wz::math::projection_perspective_dx(70.0f * kPi / 180.0f, aspect, 0.1f, 100.0f);
