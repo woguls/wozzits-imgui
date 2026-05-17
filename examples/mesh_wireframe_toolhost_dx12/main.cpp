@@ -11,11 +11,15 @@
 #include <engine/rendering/renderable_gpu_cache.h>
 #include <engine/rendering/renderable_debug_runtime.h>
 #include <engine/rendering/builtin_render_programs.h>
+#include <engine/rendering/render_resource_resolver.h>
 
 #include <event/platform_event.h>
 #include <gpu/gpu.h>
+#include <gpu/dx12/dx12.h>
 #include <gpu/dx12/dx12_internal.h>
-#include <gpu/dx12/dx12_mesh_wireframe_debug.h>
+
+#include <render/frame/render_frame.h>
+#include <scene/compile/compiled_scene.h>
 
 #include <math/mat4.h>
 #include <math/projection.h>
@@ -121,6 +125,9 @@ namespace
 
         wz::engine::rendering::RenderableGpuCache   renderable_cache{};
         wz::engine::rendering::DebugRenderableSetup debug_setup{};
+        wz::engine::rendering::RenderResourceResolver resolver{};
+
+        wz::scene::MeshHandle mesh_handle{ wz::scene::INVALID_MESH };
 
         OrbitCamera camera{};
     };
@@ -168,13 +175,19 @@ namespace
         if (!report.ok())
             return false;
 
-        return setup_debug_renderable_context(
-            state.ctx.device,
-            assets,
-            state.renderable_cache,
-            renderable,
-            shaders,
-            state.debug_setup);
+        if (!setup_debug_renderable_context(
+                state.ctx.device,
+                assets,
+                state.renderable_cache,
+                renderable,
+                shaders,
+                state.debug_setup))
+            return false;
+
+        state.mesh_handle =
+            state.resolver.register_mesh(state.debug_setup.prepared.gpu_resource);
+
+        return true;
     }
 
 
@@ -187,15 +200,17 @@ namespace
         const int h = static_cast<int>(
             wz::gpu::dx12::internal::get_height(state.ctx.device));
 
-        wz::gpu::dx12::MeshWireframeDebugView view{};
+        wz::render::DrawCommand cmd{};
+        cmd.stage = wz::render::PipelineStage::OpaqueGeometry;
+        cmd.kind  = wz::render::DrawCommandKind::Mesh;
+        cmd.mesh  = state.mesh_handle;
+        cmd.world = wz::math::mat4_identity();
 
-        const wz::math::Mat4 world    = wz::math::mat4_identity();
-        const wz::math::Mat4 view_proj = make_view_proj(state.camera, w, h);
+        wz::render::RenderFrameView frame{};
+        frame.opaque               = std::span<const wz::render::DrawCommand>(&cmd, 1);
+        frame.view.view_projection = make_view_proj(state.camera, w, h);
 
-        for (int i = 0; i < 16; ++i) view.world[i]     = world.m[i];
-        for (int i = 0; i < 16; ++i) view.view_proj[i] = view_proj.m[i];
-
-        wz::gpu::dx12::submit_mesh_wireframe_debug_frame(state.ctx.device, view);
+        wz::gpu::dx12::submit_render_frame(state.ctx.device, frame, state.resolver);
     }
 
 
