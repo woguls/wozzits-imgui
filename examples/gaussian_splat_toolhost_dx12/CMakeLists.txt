@@ -33,3 +33,10 @@ add_custom_command(TARGET gaussian_splat_toolhost_dx12 POST_BUILD
         "$<TARGET_FILE_DIR:gaussian_splat_toolhost_dx12>/resources"
     COMMENT "Copying Wozzits resources for gaussian_splat_toolhost_dx12"
 )
+
+add_custom_command(TARGET gaussian_splat_toolhost_dx12 POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_LIST_DIR}/splats"
+        "$<TARGET_FILE_DIR:gaussian_splat_toolhost_dx12>/resources/splats"
+    COMMENT "Copying Gaussian splat PLY fixtures for gaussian_splat_toolhost_dx12"
+)

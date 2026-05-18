@@ -6,7 +6,11 @@
 #include <engine/engine.h>
 
 #include <engine/assets/gaussian_splat_asset_module.h>
+#include <engine/assets/gaussian_splat/gaussian_splat_cloud.h>
+#include <engine/assets/file_carrier_asset_module.h>
 #include <engine/assets/renderable_asset_module.h>
+#include <engine/assets/schema_ids.h>
+#include <engine/assets/type_extensions.h>
 #include <engine/rendering/renderable_gpu_cache.h>
 #include <engine/rendering/renderable_pipeline_cache.h>
 #include <engine/rendering/builtin_render_programs.h>
@@ -46,11 +50,33 @@ namespace
     {
         float yaw      = 0.0f;
         float pitch    = 0.25f;
-        float distance = 5.0f;
+        float distance = 4.0f;
         float target_x = 0.0f;
         float target_y = 0.0f;
         float target_z = 0.0f;
     };
+
+    // Fit the camera to a bounding box: centre the target on the midpoint and
+    // set the distance to the diagonal so the whole cloud is in frame.
+    OrbitCamera fit_camera_to_bounds(
+        const wz::engine::assets::GaussianSplatBounds& bounds)
+    {
+        OrbitCamera cam{};
+
+        if (!bounds.valid)
+            return cam;
+
+        cam.target_x = (bounds.min[0] + bounds.max[0]) * 0.5f;
+        cam.target_y = (bounds.min[1] + bounds.max[1]) * 0.5f;
+        cam.target_z = (bounds.min[2] + bounds.max[2]) * 0.5f;
+
+        const float dx = bounds.max[0] - bounds.min[0];
+        const float dy = bounds.max[1] - bounds.min[1];
+        const float dz = bounds.max[2] - bounds.min[2];
+        cam.distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+        return cam;
+    }
 
     wz::math::Mat4 make_view_proj(const OrbitCamera& cam, int width, int height)
     {
@@ -77,8 +103,14 @@ namespace
         const wz::math::Mat4 view =
             wz::math::look_at_dx(eye, target, { 0.f, 1.f, 0.f });
 
+        // Derive near/far from distance so they stay sensible at any scale.
+        // near = 0.1% of distance (min 0.001); far = 4× distance (min 100).
+        const float near_plane = (std::max)(0.001f, cam.distance * 0.001f);
+        const float far_plane  = (std::max)(100.0f, cam.distance * 4.0f);
+
         const wz::math::Mat4 proj =
-            wz::math::projection_perspective_dx(70.0f * kPi / 180.0f, aspect, 0.1f, 100.0f);
+            wz::math::projection_perspective_dx(
+                70.0f * kPi / 180.0f, aspect, near_plane, far_plane);
 
         return wz::math::mul(proj, view);
     }
@@ -101,6 +133,7 @@ namespace
         wz::scene::SplatHandle splat_handle{ wz::scene::INVALID_SPLAT };
 
         OrbitCamera camera{};
+        OrbitCamera default_camera{};
     };
 
 
@@ -113,13 +146,19 @@ namespace
 
         EngineAssetLibrary& assets = *state.ctx.assets;
 
-        // Procedural sphere of Gaussian splats
+        // Load a real 3DGS PLY file from disk (binary or ASCII — both supported).
+        const wz::asset::AssetKey ply_file =
+            assets.files().register_file_node(
+                "splats/Tree.ply",
+                kRawFileSchema,
+                kAssetTypeRawFile);
+        if (ply_file == wz::asset::AssetKey{})
+            return false;
+
         GaussianSplatCloudAsset splat_cloud =
-            assets.gaussian_splats().create_procedural_cloud({
-                .name        = "splat/debug_sphere",
-                .count       = 4096,
-                .radius      = 1.5f,
-                .splat_scale = 1.05f,
+            assets.gaussian_splats().create_from_ply({
+                .name        = "splat/sofa",
+                .source_file = ply_file,
             });
         if (!splat_cloud.valid())
             return false;
@@ -147,6 +186,22 @@ namespace
         const auto report = assets.resolve_all();
         if (!report.ok())
             return false;
+
+        // Fit the orbit camera to the imported cloud so any PLY file is visible
+        // regardless of its coordinate range. Store as the reset target too.
+        {
+            const auto cloud_handle = assets.gaussian_splats().get_cloud(splat_cloud);
+            if (cloud_handle.valid())
+            {
+                const auto* cloud_data =
+                    assets.gaussian_splats().get_cloud_data(cloud_handle);
+                if (cloud_data && cloud_data->bounds.valid)
+                {
+                    state.camera         = fit_camera_to_bounds(cloud_data->bounds);
+                    state.default_camera = state.camera;
+                }
+            }
+        }
 
         // Realize GPU resources and pipeline.
         const auto handle   = assets.renderables().get_renderable(renderable);
@@ -213,7 +268,7 @@ namespace
         ImGui::SetNextWindowBgAlpha(0.85f);
         ImGui::Begin("Gaussian Splat Toolhost");
 
-        ImGui::Text("Track A renderer — splat cloud via RenderResourceResolver");
+        ImGui::Text("splats/sofa_ascii.ply — Track A renderer via RenderResourceResolver");
         ImGui::Separator();
 
         if (ImGui::CollapsingHeader("Frame", ImGuiTreeNodeFlags_DefaultOpen))
@@ -230,13 +285,18 @@ namespace
 
         if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen))
         {
-            ImGui::SliderFloat("Yaw",      &state.camera.yaw,      -3.14159f, 3.14159f);
-            ImGui::SliderFloat("Pitch",    &state.camera.pitch,    -1.50f,    1.50f);
-            ImGui::SliderFloat("Distance", &state.camera.distance,  1.0f,     30.0f);
-            ImGui::DragFloat3("Target",    &state.camera.target_x,  0.05f);
+            ImGui::SliderFloat("Yaw",   &state.camera.yaw,   -3.14159f, 3.14159f);
+            ImGui::SliderFloat("Pitch", &state.camera.pitch, -1.50f,    1.50f);
+
+            // Step at 1% of current distance so dragging feels natural at any scale.
+            const float dist_step = (std::max)(0.001f, state.camera.distance * 0.01f);
+            ImGui::DragFloat("Distance", &state.camera.distance, dist_step, 0.001f, 0.0f);
+
+            const float target_step = dist_step;
+            ImGui::DragFloat3("Target", &state.camera.target_x, target_step);
 
             if (ImGui::Button("Reset Camera"))
-                state.camera = OrbitCamera{};
+                state.camera = state.default_camera;
         }
 
         if (ImGui::CollapsingHeader("Record / Export"))
