@@ -11,8 +11,10 @@
 #include <engine/assets/renderable_asset_module.h>
 #include <engine/assets/schema_ids.h>
 #include <engine/assets/type_extensions.h>
+#include <engine/assets/render_program/render_program_asset_module.h>
 #include <engine/rendering/renderable_gpu_cache.h>
 #include <engine/rendering/renderable_pipeline_cache.h>
+#include <engine/rendering/render_program_pipeline_cache.h>
 #include <engine/rendering/builtin_render_programs.h>
 #include <engine/rendering/render_resource_resolver.h>
 
@@ -126,14 +128,17 @@ namespace
         wz::toolhost::ToolConsole              console{};
         wz::toolhost::BenchmarkRecorder        recorder{};
 
-        wz::engine::rendering::RenderableGpuCache    renderable_cache{};
-        wz::engine::rendering::RenderablePipelineCache pipeline_cache{};
-        wz::engine::rendering::RenderResourceResolver  resolver{};
+        wz::engine::rendering::RenderableGpuCache       renderable_cache{};
+        wz::engine::rendering::RenderablePipelineCache  pipeline_cache{};
+        wz::engine::rendering::RenderProgramPipelineCache render_program_cache{};
+        wz::engine::rendering::RenderResourceResolver   resolver{};
 
         wz::scene::SplatHandle splat_handle{ wz::scene::INVALID_SPLAT };
 
         OrbitCamera camera{};
         OrbitCamera default_camera{};
+
+        float base_splat_pixel_size = 100.0f;
     };
 
 
@@ -143,6 +148,7 @@ namespace
     {
         using namespace wz::engine::assets;
         using namespace wz::engine::rendering;
+
 
         EngineAssetLibrary& assets = *state.ctx.assets;
 
@@ -180,11 +186,30 @@ namespace
         if (!shaders.valid())
             return false;
 
+        wz::engine::assets::RenderProgramAsset render_program_asset =
+            assets.render_programs().create_builtin({
+                .name          = "program/gaussian_splat_debug",
+                .program       = BuiltinRenderProgram::GaussianSplatDebug,
+                .vertex_shader = shaders.vertex_shader,
+                .pixel_shader  = shaders.pixel_shader,
+            });
+        if (!render_program_asset.valid())
+            return false;
+
         if (!assets.commit())
             return false;
 
         const auto report = assets.resolve_all();
         if (!report.ok())
+            return false;
+
+        const auto program_handle =
+            assets.render_programs().get_render_program(render_program_asset);
+        if (!program_handle.valid())
+            return false;
+
+        if (!state.render_program_cache.realize(
+                state.ctx.device, assets.render_programs().table(), program_handle))
             return false;
 
         // Fit the orbit camera to the imported cloud so any PLY file is visible
@@ -204,21 +229,24 @@ namespace
         }
 
         // Realize GPU resources and pipeline.
-        const auto handle   = assets.renderables().get_renderable(renderable);
-        const auto prepared = state.renderable_cache.realize(
+        const auto handle = assets.renderables().get_renderable(renderable);
+        auto prepared     = state.renderable_cache.realize(
             state.ctx.device, assets, handle);
         if (!prepared.valid())
             return false;
 
+        // Legacy pipeline_cache kept as fallback; new path uses render_program_cache.
         if (!state.pipeline_cache.realize(
                 state.ctx.device, assets, prepared.program, shaders))
             return false;
+
+        prepared.render_program = program_handle;
 
         // Register the GPU resource with the resolver (program stored alongside).
         // The returned SplatHandle goes into DrawCommand::splats_buffer each frame.
         state.splat_handle =
             state.resolver.register_splat_cloud(
-                prepared.gpu_resource, prepared.program);
+                prepared.gpu_resource, prepared.program, prepared.render_program);
 
         return true;
     }
@@ -245,9 +273,11 @@ namespace
         frame.splats               = std::span<const wz::render::DrawCommand>(&cmd, 1);
         frame.view.view_projection = make_view_proj(state.camera, w, h);
 
-        // Track A submit: resolver maps SplatHandle → GPUHandle + program at draw time.
+        // Submit: prefers render_program_cache when handle is valid, falls back
+        // to legacy pipeline_cache for renderables without a render program.
         wz::gpu::dx12::submit_render_frame(
-            state.ctx.device, frame, state.resolver, state.pipeline_cache);
+            state.ctx.device, frame, state.resolver,
+            state.pipeline_cache, state.render_program_cache);
     }
 
 
@@ -297,6 +327,19 @@ namespace
 
             if (ImGui::Button("Reset Camera"))
                 state.camera = state.default_camera;
+        }
+
+        if (ImGui::CollapsingHeader("Splat Debug Draw", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::SliderFloat(
+                "Base splat pixel size",
+                &state.base_splat_pixel_size,
+                1.0f,
+                256.0f,
+                "%.1f px");
+
+            if (ImGui::Button("Reset Splat Size"))
+                state.base_splat_pixel_size = 32.0f;
         }
 
         if (ImGui::CollapsingHeader("Record / Export"))
