@@ -52,6 +52,7 @@ namespace
     {
         float yaw      = 0.0f;
         float pitch    = 0.25f;
+        float roll     = 0.0f;
         float distance = 4.0f;
         float target_x = 0.0f;
         float target_y = 0.0f;
@@ -102,8 +103,31 @@ namespace
             target.z - cam.distance * cp * cy,
         };
 
+        // Roll: rotate the camera's up vector around the forward (eye→target) axis.
+        // Compute natural up = world_up projected perpendicular to forward,
+        // then rotate it toward the right vector by the roll angle.
+        const float fx = target.x - eye.x;
+        const float fy = target.y - eye.y;
+        const float fz = target.z - eye.z;
+        const float f_inv_len = 1.f / std::sqrt(fx*fx + fy*fy + fz*fz);
+        const float fnx = fx*f_inv_len, fny = fy*f_inv_len, fnz = fz*f_inv_len;
+
+        // natural_up = world_up - forward * dot(world_up, forward); world_up = (0,1,0)
+        const float nux = -fnx*fny, nuy = 1.f - fny*fny, nuz = -fnz*fny;
+        const float nu_inv_len = 1.f / std::sqrt(nux*nux + nuy*nuy + nuz*nuz);
+        const float nx = nux*nu_inv_len, ny = nuy*nu_inv_len, nz = nuz*nu_inv_len;
+
+        // right = cross(natural_up, forward)
+        const float rx = ny*fnz - nz*fny;
+        const float ry = nz*fnx - nx*fnz;
+        const float rz = nx*fny - ny*fnx;
+
+        const float cr = std::cos(cam.roll);
+        const float sr = std::sin(cam.roll);
+        const wz::math::Vec3 up{ nx*cr + rx*sr, ny*cr + ry*sr, nz*cr + rz*sr };
+
         const wz::math::Mat4 view =
-            wz::math::look_at_dx(eye, target, { 0.f, 1.f, 0.f });
+            wz::math::look_at_dx(eye, target, up);
 
         // Derive near/far from distance so they stay sensible at any scale.
         // near = 0.1% of distance (min 0.001); far = 4× distance (min 100).
@@ -317,6 +341,7 @@ namespace
         {
             ImGui::SliderFloat("Yaw",   &state.camera.yaw,   -3.14159f, 3.14159f);
             ImGui::SliderFloat("Pitch", &state.camera.pitch, -1.50f,    1.50f);
+            ImGui::SliderFloat("Roll",  &state.camera.roll,  -3.14159f, 3.14159f);
 
             // Step at 1% of current distance so dragging feels natural at any scale.
             const float dist_step = (std::max)(0.001f, state.camera.distance * 0.01f);
