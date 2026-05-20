@@ -351,9 +351,16 @@ namespace
         if (!prepared.valid())
             return false;
 
-        if (!state.pipeline_cache.realize(
-                state.ctx.device, assets, prepared.program, shaders))
-            return false;
+        // The legacy pipeline_cache is only needed when render_program is absent.
+        // On the pull path the submit uses render_program_cache exclusively, so
+        // skip realizing the legacy PSO — it would fail because the pull VS has
+        // no vertex inputs but the GaussianSplatDebug PSO factory expects them.
+        if (!state.use_splat_pull)
+        {
+            if (!state.pipeline_cache.realize(
+                    state.ctx.device, assets, prepared.program, shaders))
+                return false;
+        }
 
         prepared.render_program = render_program_handle;
 
