@@ -191,6 +191,12 @@ namespace
         bool  use_threshold    = false;
         float emit_threshold   = 0.0f;
 
+        // ── Render path toggle ────────────────────────────────────────────────
+
+        // false = GaussianSplatDebug  (IA, SplatVertexInstanced)
+        // true  = GaussianSplatPullDebug (StructuredBuffer pull, SplatPull)
+        bool use_splat_pull = false;
+
         // ── Display info ──────────────────────────────────────────────────────
 
         uint64_t last_splat_count = 0;
@@ -217,9 +223,19 @@ namespace
 
         // ── Shaders + render program ──────────────────────────────────────────
 
+        // Select program based on the pull-path toggle.
+        const BuiltinRenderProgram selected_program =
+            state.use_splat_pull
+            ? BuiltinRenderProgram::GaussianSplatPullDebug
+            : BuiltinRenderProgram::GaussianSplatDebug;
+
+        const char* program_name =
+            state.use_splat_pull
+            ? "program/gaussian_splat_pull_debug"
+            : "program/gaussian_splat_debug";
+
         ShaderPairDesc shader_desc{};
-        if (!get_builtin_shader_pair_desc(
-                BuiltinRenderProgram::GaussianSplatDebug, shader_desc))
+        if (!get_builtin_shader_pair_desc(selected_program, shader_desc))
             return false;
 
         const ShaderPairAsset shaders =
@@ -229,8 +245,8 @@ namespace
 
         const RenderProgramAsset render_program_asset =
             assets.render_programs().create_builtin({
-                .name          = "program/gaussian_splat_debug",
-                .program       = BuiltinRenderProgram::GaussianSplatDebug,
+                .name          = program_name,
+                .program       = selected_program,
                 .vertex_shader = shaders.vertex_shader,
                 .pixel_shader  = shaders.pixel_shader,
             });
@@ -410,6 +426,32 @@ namespace
         ImGui::Begin("Scalar Field Splat Toolhost");
 
         ImGui::Text("Procedural scalar field \xe2\x86\x92 Gaussian splat cloud");
+        ImGui::Separator();
+
+        // ── Render path toggle ────────────────────────────────────────────────
+        {
+            bool changed = false;
+            bool ia   = !state.use_splat_pull;
+            bool pull =  state.use_splat_pull;
+
+            if (ImGui::RadioButton("IA  (GaussianSplatDebug)", ia))
+            {
+                state.use_splat_pull = false;
+                changed = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Pull (GaussianSplatPullDebug)", pull))
+            {
+                state.use_splat_pull = true;
+                changed = true;
+            }
+
+            if (changed)
+            {
+                if (!regenerate_scene(state))
+                    state.console.push_string("[error] path switch failed — see log");
+            }
+        }
         ImGui::Separator();
 
         if (ImGui::CollapsingHeader("Frame"))
