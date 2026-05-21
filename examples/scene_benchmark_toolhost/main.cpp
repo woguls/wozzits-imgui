@@ -10,6 +10,7 @@
 #define NOMINMAX
 #include <Windows.h>
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -128,8 +129,192 @@ namespace
             "culled_splats",
             "scene_nodes",
             "dirty_nodes",
+
+            "density_visible_clouds",
+            "density_submitted_splats",
+            "density_area_mean",
+            "density_area_min",
+            "density_area_max",
+            "density_spp_mean",
+            "density_pps_mean",
+            "density_oversampled",
+            "density_valid",
+            "density_undersampled",
         },
     };
+
+
+    // ─── Screen-space density measurement (Stage 1) ────────────────────────
+    //
+    // For each visible splat cloud instance, estimate projected screen
+    // footprint from its local AABB and derive splats-per-pixel density.
+    // No behavior change — measurement only.
+
+    struct CloudDensityBand
+    {
+        float projected_area_px = 0.0f;
+        float splats_per_pixel  = 0.0f;
+        float pixels_per_splat  = 0.0f;
+    };
+
+    struct DensityMetrics
+    {
+        uint32_t visible_clouds     = 0;
+        uint64_t submitted_splats   = 0;
+
+        float projected_area_mean   = 0.0f;
+        float projected_area_min    = 0.0f;
+        float projected_area_max    = 0.0f;
+
+        float splats_per_pixel_mean = 0.0f;
+        float pixels_per_splat_mean = 0.0f;
+
+        uint32_t oversampled_clouds = 0;   // splats_per_pixel > threshold
+        uint32_t valid_clouds       = 0;
+        uint32_t undersampled_clouds= 0;   // pixels_per_splat > threshold
+    };
+
+    // Provisional thresholds — will be tuned from benchmark data.
+    constexpr float kOversampled_SplatsPerPixel = 4.0f;
+    constexpr float kUndersampled_PixelsPerSplat = 8.0f;
+
+    // Project a local-space AABB through world × view_projection into a
+    // screen-space bounding rectangle.  Returns area in pixels, or 0 if
+    // the cloud is entirely behind the near plane.
+    float projected_area_px(
+        const float aabb_min[3],
+        const float aabb_max[3],
+        const wz::math::Mat4& world,
+        const wz::math::Mat4& view_projection,
+        float viewport_w,
+        float viewport_h)
+    {
+        using namespace wz::math;
+
+        const Mat4 wvp = mul(view_projection, world);
+
+        // 8 AABB corners.
+        const float cx[2] = { aabb_min[0], aabb_max[0] };
+        const float cy[2] = { aabb_min[1], aabb_max[1] };
+        const float cz[2] = { aabb_min[2], aabb_max[2] };
+
+        float screen_min_x =  1e30f;
+        float screen_min_y =  1e30f;
+        float screen_max_x = -1e30f;
+        float screen_max_y = -1e30f;
+
+        int valid_corners = 0;
+
+        for (int i = 0; i < 8; ++i)
+        {
+            const Vec3 local{
+                cx[(i >> 0) & 1],
+                cy[(i >> 1) & 1],
+                cz[(i >> 2) & 1]
+            };
+
+            const Vec4 clip = vec4_mul_point(wvp, local);
+
+            // Skip corners behind the near plane.
+            if (clip.w <= 0.0001f) continue;
+
+            const float inv_w = 1.0f / clip.w;
+            const float ndc_x = clip.x * inv_w;
+            const float ndc_y = clip.y * inv_w;
+
+            // NDC [-1,1] → pixels [0, viewport].
+            const float px = (ndc_x * 0.5f + 0.5f) * viewport_w;
+            const float py = (0.5f - ndc_y * 0.5f) * viewport_h;
+
+            if (px < screen_min_x) screen_min_x = px;
+            if (py < screen_min_y) screen_min_y = py;
+            if (px > screen_max_x) screen_max_x = px;
+            if (py > screen_max_y) screen_max_y = py;
+
+            ++valid_corners;
+        }
+
+        if (valid_corners == 0)
+            return 0.0f;
+
+        // Clamp to viewport.
+        screen_min_x = (std::max)(screen_min_x, 0.0f);
+        screen_min_y = (std::max)(screen_min_y, 0.0f);
+        screen_max_x = (std::min)(screen_max_x, viewport_w);
+        screen_max_y = (std::min)(screen_max_y, viewport_h);
+
+        const float w = screen_max_x - screen_min_x;
+        const float h = screen_max_y - screen_min_y;
+
+        return (w > 0.0f && h > 0.0f) ? w * h : 0.0f;
+    }
+
+    DensityMetrics compute_density_metrics(
+        std::span<const wz::render::DrawCommand> splat_cmds,
+        uint32_t cloud_splat_count,
+        const float cloud_aabb_min[3],
+        const float cloud_aabb_max[3],
+        const wz::math::Mat4& view_projection,
+        float viewport_w,
+        float viewport_h)
+    {
+        DensityMetrics m{};
+
+        float area_sum = 0.0f;
+        float spp_sum  = 0.0f;
+        float pps_sum  = 0.0f;
+
+        m.projected_area_min = 1e30f;
+        m.projected_area_max = 0.0f;
+
+        for (const auto& dc : splat_cmds)
+        {
+            if (dc.splats_buffer == wz::scene::INVALID_SPLAT)
+                continue;
+
+            const float area = projected_area_px(
+                cloud_aabb_min, cloud_aabb_max,
+                dc.world, view_projection,
+                viewport_w, viewport_h);
+
+            if (area <= 0.0f)
+                continue;
+
+            const float spp = static_cast<float>(cloud_splat_count) / area;
+            const float pps = area / static_cast<float>(cloud_splat_count);
+
+            ++m.visible_clouds;
+            m.submitted_splats += cloud_splat_count;
+
+            area_sum += area;
+            spp_sum  += spp;
+            pps_sum  += pps;
+
+            if (area < m.projected_area_min) m.projected_area_min = area;
+            if (area > m.projected_area_max) m.projected_area_max = area;
+
+            if (spp > kOversampled_SplatsPerPixel)
+                ++m.oversampled_clouds;
+            else if (pps > kUndersampled_PixelsPerSplat)
+                ++m.undersampled_clouds;
+            else
+                ++m.valid_clouds;
+        }
+
+        if (m.visible_clouds > 0)
+        {
+            const float n = static_cast<float>(m.visible_clouds);
+            m.projected_area_mean   = area_sum / n;
+            m.splats_per_pixel_mean = spp_sum  / n;
+            m.pixels_per_splat_mean = pps_sum  / n;
+        }
+        else
+        {
+            m.projected_area_min = 0.0f;
+        }
+
+        return m;
+    }
 
 
     // ─── Per-frame phase timings ─────────────────────────────────────────────
@@ -174,7 +359,13 @@ namespace
 
         wz::scene::SplatHandle splat_handle{ wz::scene::INVALID_SPLAT };
 
+        // Cloud metadata saved at build time for density measurement.
+        float    cloud_aabb_min[3] = {};
+        float    cloud_aabb_max[3] = {};
+        uint32_t cloud_splat_count = 0;
+
         FramePhaseTimings timings{};
+        DensityMetrics    density{};
 
         // GPU timing
         wz::gpu::dx12::GpuTimer gpu_timer{};
@@ -271,6 +462,17 @@ namespace
             std::to_string(wz::core::graph::node_count(
                 state.app.scene_runtime.scene.polytree)),
             std::to_string(state.app.scene_runtime.dirty_nodes.size()),
+
+            std::to_string(state.density.visible_clouds),
+            std::to_string(state.density.submitted_splats),
+            ds(state.density.projected_area_mean),
+            ds(state.density.projected_area_min),
+            ds(state.density.projected_area_max),
+            ds(state.density.splats_per_pixel_mean),
+            ds(state.density.pixels_per_splat_mean),
+            std::to_string(state.density.oversampled_clouds),
+            std::to_string(state.density.valid_clouds),
+            std::to_string(state.density.undersampled_clouds),
             });
     }
 
@@ -334,6 +536,17 @@ namespace
             assets.gaussian_splats().get_cloud_data(cloud_asset_handle);
         if (!cloud_data || !cloud_data->valid())
             return false;
+
+        // Save cloud metadata for per-frame density measurement.
+        state.cloud_splat_count = static_cast<uint32_t>(cloud_data->splats.size());
+        if (cloud_data->bounds.valid)
+        {
+            for (int i = 0; i < 3; ++i)
+            {
+                state.cloud_aabb_min[i] = cloud_data->bounds.min[i];
+                state.cloud_aabb_max[i] = cloud_data->bounds.max[i];
+            }
+        }
 
         // ── Build scene graph: root + grid of cloud instance nodes ──────
 
@@ -705,6 +918,52 @@ namespace
         ImGui::End();
     }
 
+    // ─── Density panel ───────────────────────────────────────────────────────
+
+    void draw_density_panel(BenchSceneToolhostState& state)
+    {
+        ImGui::SetNextWindowPos(ImVec2(560.0f, 560.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(380.0f, 320.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowBgAlpha(0.85f);
+        ImGui::Begin("Splat Density");
+
+        const auto& d = state.density;
+
+        ImGui::Text("Visible clouds:    %u", d.visible_clouds);
+        ImGui::Text("Submitted splats:  %llu",
+            static_cast<unsigned long long>(d.submitted_splats));
+        ImGui::Text("Cloud splat count: %u", state.cloud_splat_count);
+
+        ImGui::Separator();
+        ImGui::Text("Projected area (px)");
+        ImGui::Text("  mean: %.0f  min: %.0f  max: %.0f",
+            d.projected_area_mean, d.projected_area_min, d.projected_area_max);
+
+        ImGui::Separator();
+        ImGui::Text("Density");
+        ImGui::Text("  splats/pixel (mean): %.2f", d.splats_per_pixel_mean);
+        ImGui::Text("  pixels/splat (mean): %.2f", d.pixels_per_splat_mean);
+
+        ImGui::Separator();
+        ImGui::Text("Classification");
+
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
+            "  oversampled:   %u  (spp > %.1f)",
+            d.oversampled_clouds, kOversampled_SplatsPerPixel);
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f),
+            "  valid:         %u", d.valid_clouds);
+        ImGui::TextColored(ImVec4(0.5f, 0.7f, 1.0f, 1.0f),
+            "  undersampled:  %u  (pps > %.1f)",
+            d.undersampled_clouds, kUndersampled_PixelsPerSplat);
+
+        ImGui::Separator();
+        ImGui::Text("Thresholds (provisional)");
+        ImGui::Text("  oversampled: spp > %.1f", kOversampled_SplatsPerPixel);
+        ImGui::Text("  undersampled: pps > %.1f", kUndersampled_PixelsPerSplat);
+
+        ImGui::End();
+    }
+
 } // namespace
 
 
@@ -745,6 +1004,17 @@ int main()
         "culled_splats",
         "scene_nodes",
         "dirty_nodes",
+
+        "density_visible_clouds",
+        "density_submitted_splats",
+        "density_area_mean",
+        "density_area_min",
+        "density_area_max",
+        "density_spp_mean",
+        "density_pps_mean",
+        "density_oversampled",
+        "density_valid",
+        "density_undersampled",
     });
 
     // Build the scene definition.  pre_commit runs inside wz::bench::init()
@@ -817,6 +1087,21 @@ int main()
             if (!ctx.running)
                 return;
 
+            // ── Density measurement ──────────────────────────────────────
+            {
+                const auto& rf = state.app.frame.render_frame.frame;
+                const float vp_w = static_cast<float>(fctx.input.window.width);
+                const float vp_h = static_cast<float>(fctx.input.window.height);
+
+                state.density = compute_density_metrics(
+                    rf.splats,
+                    state.cloud_splat_count,
+                    state.cloud_aabb_min,
+                    state.cloud_aabb_max,
+                    rf.view.view_projection,
+                    vp_w, vp_h);
+            }
+
             {
                 const auto t0 = Clock::now();
 
@@ -873,6 +1158,7 @@ int main()
                 draw_benchmark_panel(state, fctx);
                 draw_navigation_panel(state);
                 draw_scene_panel(state);
+                draw_density_panel(state);
                 wz::toolhost::draw_console_panel(state.console);
 
                 ImGui::Render();
