@@ -37,6 +37,7 @@
 
 #include <gpu/gpu.h>
 #include <gpu/dx12/dx12.h>
+#include <gpu/dx12/dx12_gpu_timer.h>
 
 #include <math/mat4.h>
 
@@ -106,7 +107,10 @@ namespace
             "submit_opaque_ms",
             "submit_splat_ms",
             "imgui_ms",
+            "end_frame_ms",
+            "present_ms",
             "end_present_ms",
+            "gpu_splat_ms",
 
             "total_job_ms",
             "render_prep_job_ms",
@@ -139,7 +143,11 @@ namespace
         double submit_opaque_ms = 0.0;
         double submit_splat_ms = 0.0;
         double imgui_ms = 0.0;
+        double end_frame_ms = 0.0;
+        double present_ms = 0.0;
         double end_present_ms = 0.0;
+
+        double gpu_splat_ms = 0.0;  // GPU timestamp: splat draw pass
     };
 
     // ─── Application state ────────────────────────────────────────────────────
@@ -167,6 +175,10 @@ namespace
         wz::scene::SplatHandle splat_handle{ wz::scene::INVALID_SPLAT };
 
         FramePhaseTimings timings{};
+
+        // GPU timing
+        wz::gpu::dx12::GpuTimer gpu_timer{};
+        bool vsync_off = false;
     };
 
     void record_benchmark_row(
@@ -236,7 +248,10 @@ namespace
             ds(state.timings.submit_opaque_ms),
             ds(state.timings.submit_splat_ms),
             ds(state.timings.imgui_ms),
+            ds(state.timings.end_frame_ms),
+            ds(state.timings.present_ms),
             ds(state.timings.end_present_ms),
+            ds(state.timings.gpu_splat_ms),
 
             ds(ticks_to_ms(total_ticks)),
             ds(ticks_to_ms(prep_ticks)),
@@ -533,7 +548,12 @@ namespace
             ImGui::Text("Submit opaque: %.4f ms", state.timings.submit_opaque_ms);
             ImGui::Text("Submit splat: %.4f ms", state.timings.submit_splat_ms);
             ImGui::Text("ImGui: %.4f ms", state.timings.imgui_ms);
+            ImGui::Text("End frame (GPU wait): %.4f ms", state.timings.end_frame_ms);
+            ImGui::Text("Present (vblank): %.4f ms", state.timings.present_ms);
             ImGui::Text("End + present: %.4f ms", state.timings.end_present_ms);
+            ImGui::Separator();
+            ImGui::Text("GPU splat draw: %.4f ms", state.timings.gpu_splat_ms);
+            ImGui::Checkbox("Vsync off", &state.vsync_off);
         }
 
         if (ImGui::CollapsingHeader("Scene", ImGuiTreeNodeFlags_DefaultOpen))
@@ -704,7 +724,10 @@ int main()
         "submit_opaque_ms",
         "submit_splat_ms",
         "imgui_ms",
+        "end_frame_ms",
+        "present_ms",
         "end_present_ms",
+        "gpu_splat_ms",
 
         "total_job_ms",
         "render_prep_job_ms",
@@ -765,6 +788,12 @@ int main()
         return 1;
     }
 
+    // GPU timestamp timer: slot 0 = splat draw pass.
+    constexpr uint32_t kGpuTimerSlots = 1;
+    constexpr uint32_t kSlotSplatDraw = 0;
+    state.gpu_timer = wz::gpu::dx12::create_gpu_timer(
+        state.app.ctx.device, kGpuTimerSlots);
+
     wz::engine::run([&state](wz::engine::Context& ctx, wz::engine::FrameContext& fctx)
     {
             state.timings = {};
@@ -820,10 +849,16 @@ int main()
                     splat_frame.splats = rf.splats;
                     splat_frame.view   = rf.view;
 
+                    wz::gpu::dx12::gpu_timer_begin(
+                        state.gpu_timer, state.app.ctx.device, kSlotSplatDraw);
+
                     wz::gpu::dx12::submit_render_frame(
                         state.app.ctx.device, splat_frame,
                         state.resolver, state.pipeline_cache,
                         state.render_program_cache);
+
+                    wz::gpu::dx12::gpu_timer_end(
+                        state.gpu_timer, state.app.ctx.device, kSlotSplatDraw);
                 }
 
                 const auto t1 = Clock::now();
@@ -847,20 +882,38 @@ int main()
                 state.timings.imgui_ms = elapsed_ms(t0, t1);
             }
 
+            // Resolve GPU timestamps before closing the command list.
+            wz::gpu::dx12::gpu_timer_resolve(
+                state.gpu_timer, state.app.ctx.device);
+
             {
                 const auto t0 = Clock::now();
 
                 wz::gpu::end_frame(state.app.ctx.device);
-                wz::gpu::present(state.app.ctx.device);
 
                 const auto t1 = Clock::now();
-                state.timings.end_present_ms = elapsed_ms(t0, t1);
+                state.timings.end_frame_ms = elapsed_ms(t0, t1);
+
+                // Read GPU timer results now — the fence wait in end_frame
+                // guarantees the readback buffer has valid data.
+                state.timings.gpu_splat_ms =
+                    wz::gpu::dx12::gpu_timer_elapsed_ms(
+                        state.gpu_timer, kSlotSplatDraw);
+
+                const uint32_t sync = state.vsync_off ? 0u : 1u;
+                wz::gpu::present(state.app.ctx.device, sync);
+
+                const auto t2 = Clock::now();
+                state.timings.present_ms = elapsed_ms(t1, t2);
+                state.timings.end_present_ms = elapsed_ms(t0, t2);
             }
 
             const auto frame_t1 = Clock::now();
             state.timings.frame_cpu_ms = elapsed_ms(frame_t0, frame_t1);
             record_benchmark_row(state, fctx);
     });
+
+    wz::gpu::dx12::destroy_gpu_timer(state.gpu_timer);
 
     state.imgui.shutdown(state.app.ctx.window);
     state.renderable_cache.clear();
