@@ -1,8 +1,8 @@
 // examples/scene_benchmark_toolhost/main.cpp
 //
-// Splat benchmark: empty Track B scene + Tree.ply gaussian splat Track A.
-// BenchmarkApp owns the window, device, empty scene graph, timing, and fly camera.
-// Press ESC to toggle navigation; BKSPC to quit.
+// Scene-owned splat benchmark: multiple instances of Tree.ply placed in
+// a grid via the scene builder.  Each PLY instance is one scene node;
+// the renderer handles culling, compilation, and draw-command generation.
 // BenchmarkApp owns the window, device, scene graph, and fly camera.
 // Press ESC to toggle navigation; BKSPC to quit.
 
@@ -120,15 +120,15 @@ namespace
             "total_commands",
             "visible_opaque",
             "culled_opaque",
+            "visible_splats",
+            "culled_splats",
             "scene_nodes",
             "dirty_nodes",
         },
     };
 
 
-    // ─── Platform timing ──────────────────────────────────────────────────────
-
-
+    // ─── Per-frame phase timings ─────────────────────────────────────────────
 
     struct FramePhaseTimings
     {
@@ -158,21 +158,15 @@ namespace
         wz::engine::rendering::RenderResourceResolver     resolver{};
 
         // Asset handles populated during scene_def.pre_commit (before commit());
-        // used in init_splat_gpu() after init() returns.
+        // used in build_splat_scene() (the scene_def.build callback).
         wz::engine::assets::GaussianSplatCloudAsset splat_cloud{};
         wz::engine::assets::RenderableAsset         splat_renderable{};
         wz::engine::assets::ShaderPairAsset         splat_shaders{};
         wz::engine::assets::RenderProgramAsset      splat_render_program{};
 
         wz::scene::SplatHandle splat_handle{ wz::scene::INVALID_SPLAT };
-        float base_splat_pixel_size = 32.0f;
-
-        int splat_grid_x = 5;
-        int splat_grid_z = 5;
-        float splat_spacing = 4.0f;
 
         FramePhaseTimings timings{};
-
     };
 
     void record_benchmark_row(
@@ -257,32 +251,109 @@ namespace
             std::to_string(total_cmds),
             std::to_string(culling.visible_opaque),
             std::to_string(culling.culled_opaque),
+            std::to_string(culling.visible_splats),
+            std::to_string(culling.culled_splats),
             std::to_string(wz::core::graph::node_count(
                 state.app.scene_runtime.scene.polytree)),
             std::to_string(state.app.scene_runtime.dirty_nodes.size()),
             });
     }
 
-    // ─── empty scene builder ────────────────────────────────────────────
+    // ─── Grid parameters ─────────────────────────────────────────────────────
 
-    bool build_empty_scene(
+    constexpr int   k_grid_x       = 10;     // instances along X
+    constexpr int   k_grid_z       = 10;     // instances along Z
+    constexpr float k_grid_spacing = 5.0f; // distance between instance centres
+
+    // ─── Scene builder: PLY cloud instances on a grid ─────────────────────
+    //
+    // Realizes GPU resources for the splat cloud, then places k_grid_x × k_grid_z
+    // instances of Tree.ply into the scene graph.  Each instance is one scene node
+    // with a translation transform; the renderer handles culling, compilation,
+    // and draw-command generation.
+
+    bool build_splat_scene(
         wz::bench::SceneRuntime& runtime,
-        wz::engine::AppContext&  /*ctx*/)
+        wz::engine::AppContext&  ctx,
+        BenchSceneToolhostState& state)
     {
         using namespace wz::scene;
         using namespace wz::core::graph;
         using namespace wz::math;
+        using namespace wz::engine::assets;
+        using namespace wz::engine::rendering;
 
+        // ── GPU realization (assets are committed + resolved by now) ─────
+
+        EngineAssetLibrary& assets = *ctx.assets;
+
+        const auto program_handle =
+            assets.render_programs().get_render_program(state.splat_render_program);
+        if (!program_handle.valid())
+            return false;
+
+        if (!state.render_program_cache.realize(
+                ctx.device, assets.render_programs().table(), program_handle))
+            return false;
+
+        const auto rend_handle =
+            assets.renderables().get_renderable(state.splat_renderable);
+        auto prepared =
+            state.renderable_cache.realize(ctx.device, assets, rend_handle);
+        if (!prepared.valid())
+            return false;
+
+        prepared.render_program = program_handle;
+
+        state.splat_handle = state.resolver.register_splat_cloud(
+            prepared.gpu_resource, prepared.program, prepared.render_program);
+
+        // ── Read cloud data (for camera fitting) ────────────────────────
+
+        const auto cloud_asset_handle =
+            assets.gaussian_splats().get_cloud(state.splat_cloud);
+        if (!cloud_asset_handle.valid())
+            return false;
+
+        const auto* cloud_data =
+            assets.gaussian_splats().get_cloud_data(cloud_asset_handle);
+        if (!cloud_data || !cloud_data->valid())
+            return false;
+
+        // ── Build scene graph: root + grid of cloud instance nodes ──────
+
+        const int total_instances = k_grid_x * k_grid_z;
+
+        // Centre the grid around the origin.
+        const float origin_x = -0.5f * (k_grid_x - 1) * k_grid_spacing;
+        const float origin_z = -0.5f * (k_grid_z - 1) * k_grid_spacing;
 
         SceneBuilder b;
 
         TransformNode root{};
-        root.local = mat4_identity();
-        root.flags = TransformNodeFlag::None;
+        root.local       = Mat4::identity();
+        root.flags       = TransformNodeFlag::None;
         root.motion_type = TransformNode::MotionType::Static;
-
         const NodeHandle root_h = add_node(b, root);
-        (void)root_h;
+
+        std::vector<NodeHandle> instance_handles;
+        instance_handles.reserve(total_instances);
+
+        for (int iz = 0; iz < k_grid_z; ++iz)
+        {
+            for (int ix = 0; ix < k_grid_x; ++ix)
+            {
+                TransformNode node{};
+                node.local       = Mat4::identity();
+                node.local.m[12] = origin_x + ix * k_grid_spacing;
+                node.local.m[14] = origin_z + iz * k_grid_spacing;
+                node.motion_type = TransformNode::MotionType::Static;
+
+                const NodeHandle h = add_node(b, node);
+                add_edge(b, root_h, h);
+                instance_handles.push_back(h);
+            }
+        }
 
         auto result = build(std::move(b));
         if (!result.has_value())
@@ -290,17 +361,52 @@ namespace
 
         runtime.scene = std::move(*result);
 
+        // ── Descriptors ─────────────────────────────────────────────────
+
         const uint32_t node_cnt = node_count(runtime.scene.polytree);
         runtime.descriptors.resize(node_cnt);
 
-        for (auto& desc : runtime.descriptors)
+        // Root: non-renderable
+        runtime.descriptors[root_h] = RenderableDescriptor{
+            .node_class = classify_legacy_renderable(RenderPipeline::None),
+        };
+
+        // Each instance: one cloud renderable
+        for (const NodeHandle h : instance_handles)
         {
-            desc = RenderableDescriptor{
-                .node_class = classify_legacy_renderable(RenderPipeline::None)
+            runtime.descriptors[h] = RenderableDescriptor{
+                .node_class = classify_legacy_renderable(RenderPipeline::Splat),
+                .splat_data = SplatDescriptor{
+                    .cloud_handle      = state.splat_handle,
+                    .cloud_local_index = 0,
+                },
+                .visible = true,
             };
         }
 
         propagate_all(runtime.scene.polytree);
+
+        // ── Fit camera to grid centre, pulled back to see the whole grid ─
+
+        if (cloud_data->bounds.valid)
+        {
+            const auto& bnd = cloud_data->bounds;
+            const float cloud_dx = bnd.max[0] - bnd.min[0];
+            const float cloud_dy = bnd.max[1] - bnd.min[1];
+            const float cloud_dz = bnd.max[2] - bnd.min[2];
+            const float cloud_diag =
+                std::sqrt(cloud_dx * cloud_dx + cloud_dy * cloud_dy + cloud_dz * cloud_dz);
+
+            const float grid_extent_x = (k_grid_x - 1) * k_grid_spacing;
+            const float grid_extent_z = (k_grid_z - 1) * k_grid_spacing;
+            const float grid_diag =
+                std::sqrt(grid_extent_x * grid_extent_x + grid_extent_z * grid_extent_z);
+
+            state.app.camera.x = 0.0f;
+            state.app.camera.y = (bnd.min[1] + bnd.max[1]) * 0.5f;
+            state.app.camera.z = -(grid_diag * 0.5f + cloud_diag);
+        }
+
         return true;
     }
     // ─── Splat asset registration (pre_commit hook) ───────────────────────────
@@ -358,97 +464,6 @@ namespace
         return true;
     }
 
-    // ─── Splat GPU realization (after init()) ─────────────────────────────────
-    //
-    // Asset handles are valid after wz::bench::init() commits and resolves.
-    // This step realizes GPU resources and fits the fly camera to the cloud.
-
-    bool init_splat_gpu(BenchSceneToolhostState& state)
-    {
-        using namespace wz::engine::assets;
-        using namespace wz::engine::rendering;
-
-        if (!state.splat_cloud.valid() || !state.splat_render_program.valid())
-            return false;
-
-        EngineAssetLibrary& assets = *state.app.ctx.assets;
-
-        const auto program_handle =
-            assets.render_programs().get_render_program(state.splat_render_program);
-        if (!program_handle.valid())
-            return false;
-
-        if (!state.render_program_cache.realize(
-                state.app.ctx.device,
-                assets.render_programs().table(),
-                program_handle))
-            return false;
-
-        // Fit the fly camera to the splat cloud bounds.
-        {
-            const auto cloud_handle =
-                assets.gaussian_splats().get_cloud(state.splat_cloud);
-            if (cloud_handle.valid())
-            {
-                const auto* cloud_data =
-                    assets.gaussian_splats().get_cloud_data(cloud_handle);
-                if (cloud_data && cloud_data->bounds.valid)
-                {
-                    const auto& b    = cloud_data->bounds;
-                    const float cx   = (b.min[0] + b.max[0]) * 0.5f;
-                    const float cy   = (b.min[1] + b.max[1]) * 0.5f;
-                    const float cz   = (b.min[2] + b.max[2]) * 0.5f;
-                    const float dx   = b.max[0] - b.min[0];
-                    const float dy   = b.max[1] - b.min[1];
-                    const float dz   = b.max[2] - b.min[2];
-                    const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-                    state.app.camera.x     = cx;
-                    state.app.camera.y     = cy;
-                    state.app.camera.z     = cz - dist;
-                }
-            }
-        }
-
-        const auto handle = assets.renderables().get_renderable(state.splat_renderable);
-        auto prepared     = state.renderable_cache.realize(
-            state.app.ctx.device, assets, handle);
-        if (!prepared.valid())
-            return false;
-
-        prepared.render_program = program_handle;
-
-        state.splat_handle =
-            state.resolver.register_splat_cloud(
-                prepared.gpu_resource, prepared.program, prepared.render_program);
-
-        return true;
-    }
-
-    // ─── Track A splat render ─────────────────────────────────────────────────
-    //
-    // Uses the fly camera's view_projection so splat and opaque scene share the
-    // same camera.  view is set each frame by job_build_view inside update().
-
-    void render_splats(BenchSceneToolhostState& state)
-    {
-        if (state.splat_handle == wz::scene::INVALID_SPLAT)
-            return;
-
-        wz::render::DrawCommand cmd{};
-        cmd.stage         = wz::render::PipelineStage::Splat;
-        cmd.kind          = wz::render::DrawCommandKind::GaussianSplats;
-        cmd.splats_buffer = state.splat_handle;
-        cmd.world         = wz::math::mat4_identity();
-
-        wz::render::RenderFrameView frame{};
-        frame.splats               = std::span<const wz::render::DrawCommand>(&cmd, 1);
-        frame.view.view_projection = state.app.frame.view.view_projection;
-
-        wz::gpu::dx12::submit_render_frame(
-            state.app.ctx.device, frame, state.resolver,
-            state.pipeline_cache, state.render_program_cache);
-    }
-
     // ─── Benchmark panel ──────────────────────────────────────────────────────
 
     void draw_benchmark_panel(
@@ -494,53 +509,12 @@ namespace
         const double build_render_frame_ms =
             job_ms(profile.timings, "build_render_frame");
 
-        //if (state.recorder.recording())
-        //{
-        //    const double dt  = fctx.frame.delta_seconds();
-        //    const double fps = dt > 0.0 ? 1.0 / dt : 0.0;
-
-        //    char buf[32];
-        //    auto ds = [&](double v) -> std::string {
-        //        std::snprintf(buf, sizeof(buf), "%.6g", v);
-        //        return buf;
-        //    };
-
-        //    state.recorder.push_row({
-        //        std::to_string(static_cast<uint32_t>(state.recorder.frame_count())),
-        //        ds(dt * 1000.0),
-        //        ds(fps),
-        //        ds(state.timings.frame_cpu_ms),
-        //        ds(state.timings.bench_update_ms),
-        //        ds(state.timings.begin_clear_ms),
-        //        ds(state.timings.submit_opaque_ms),
-        //        ds(state.timings.submit_splat_ms),
-        //        ds(state.timings.imgui_ms),
-        //        ds(state.timings.end_present_ms),
-
-        //        ds(ticks_to_ms(total_ticks)),
-        //        ds(ticks_to_ms(prep_ticks)),
-        //        ds(build_view_ms),
-        //        ds(compile_scene_ms),
-        //        ds(build_render_ir_ms),
-        //        ds(build_render_frame_ms),
-        //        ds(slowest ? ticks_to_ms(slowest->duration_ticks()) : 0.0),
-        //        std::to_string(opaque_cmds),
-        //        std::to_string(splat_cmds),
-        //        std::to_string(total_cmds),
-        //        std::to_string(culling.visible_opaque),
-        //        std::to_string(culling.culled_opaque),
-        //        std::to_string(wz::core::graph::node_count(
-        //            state.app.scene_runtime.scene.polytree)),
-        //        std::to_string(state.app.scene_runtime.dirty_nodes.size()),
-        //    });
-        //}
-
         ImGui::SetNextWindowPos(ImVec2(24.0f, 24.0f), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(520.0f, 500.0f), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowBgAlpha(0.85f);
         ImGui::Begin("Scene Benchmark");
 
-        ImGui::Text("Splat benchmark: empty Track B scene + gaussian splat Track A");
+        ImGui::Text("Scene-owned gaussian splat cloud (compile -> IR -> frame -> submit)");
         ImGui::Separator();
 
         if (ImGui::CollapsingHeader("Frame", ImGuiTreeNodeFlags_DefaultOpen))
@@ -607,14 +581,12 @@ namespace
 
         if (ImGui::CollapsingHeader("Render commands", ImGuiTreeNodeFlags_DefaultOpen))
         {
-            ImGui::Text("Opaque (Track B):       %llu",
+            ImGui::Text("Opaque cmds:  %llu",
                 static_cast<unsigned long long>(opaque_cmds));
-            ImGui::Text("Splats (Track B scene): %llu",
+            ImGui::Text("Splat cmds:   %llu",
                 static_cast<unsigned long long>(splat_cmds));
-            ImGui::Text("Total Track B:          %llu",
+            ImGui::Text("Total cmds:   %llu",
                 static_cast<unsigned long long>(total_cmds));
-            ImGui::Separator();
-            ImGui::Text("Gaussian splat: 1 cmd (Track A, always on)");
         }
 
         if (ImGui::CollapsingHeader("Culling", ImGuiTreeNodeFlags_DefaultOpen))
@@ -694,25 +666,21 @@ namespace
         ImGui::SetNextWindowBgAlpha(0.85f);
         ImGui::Begin("Scene");
 
-        ImGui::Text("Track B scene: empty baseline");
-        ImGui::Text("Gaussian splat: %s",
+        ImGui::Text("Scene: %dx%d grid of splats/Tree.ply (%d instances)",
+            k_grid_x, k_grid_z, k_grid_x * k_grid_z);
+        ImGui::Text("Splat handle: %s",
             state.splat_handle != wz::scene::INVALID_SPLAT
-            ? "loaded — splats/Tree.ply"
+            ? "registered"
             : "not loaded");
-
-        ImGui::Separator();
-
-        ImGui::SliderFloat(
-            "Splat pixel size",
-            &state.base_splat_pixel_size,
-            1.0f, 256.0f, "%.1f px");
+        ImGui::Text("Scene nodes: %u",
+            wz::core::graph::node_count(
+                state.app.scene_runtime.scene.polytree));
 
         ImGui::Separator();
 
         const auto& culling = state.app.frame.render_ir.ir.culling;
-        ImGui::Text("Culling");
-        ImGui::Text("  Visible opaque: %u", culling.visible_opaque);
-        ImGui::Text("  Culled opaque:  %u", culling.culled_opaque);
+        ImGui::Text("Visible splats:  %u", culling.visible_splats);
+        ImGui::Text("Culled splats:   %u", culling.culled_splats);
 
         ImGui::End();
     }
@@ -750,6 +718,8 @@ int main()
         "total_commands",
         "visible_opaque",
         "culled_opaque",
+        "visible_splats",
+        "culled_splats",
         "scene_nodes",
         "dirty_nodes",
     });
@@ -765,7 +735,10 @@ int main()
         return register_splat_assets(assets, state);
     };
 
-    scene_def.build = build_empty_scene;
+    scene_def.build = [&state](wz::bench::SceneRuntime& runtime,
+                              wz::engine::AppContext& ctx) -> bool {
+        return build_splat_scene(runtime, ctx, state);
+    };
 
     if (!wz::bench::init(state.app, std::move(scene_def)))
     {
@@ -781,13 +754,8 @@ int main()
         },
         &state);
 
-    // Realize splat GPU resources using the asset handles from pre_commit.
-    if (!init_splat_gpu(state))
-    {
-        wz::logging::set_log_sink(state.app.ctx.logger, nullptr, nullptr);
-        wz::bench::shutdown(state.app);
-        return 1;
-    }
+    // GPU realization now happens inside build_splat_scene() — the
+    // scene_def.build callback — so no separate init_splat_gpu() call.
 
     if (!state.imgui.init(state.app.ctx.window, state.app.ctx.device))
     {
@@ -843,8 +811,20 @@ int main()
             {
                 const auto t0 = Clock::now();
 
-                // Track A: submit gaussian splat via resolver (5-arg path).
-                render_splats(state);
+                // Submit scene-owned splats through the 5-arg path.
+                // No patching — the renderer produces the commands, we submit them.
+                const auto& rf = state.app.frame.render_frame.frame;
+                if (!rf.splats.empty())
+                {
+                    wz::render::RenderFrameView splat_frame{};
+                    splat_frame.splats = rf.splats;
+                    splat_frame.view   = rf.view;
+
+                    wz::gpu::dx12::submit_render_frame(
+                        state.app.ctx.device, splat_frame,
+                        state.resolver, state.pipeline_cache,
+                        state.render_program_cache);
+                }
 
                 const auto t1 = Clock::now();
                 state.timings.submit_splat_ms = elapsed_ms(t0, t1);
